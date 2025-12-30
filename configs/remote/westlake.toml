@@ -1,0 +1,37 @@
+host = "172.16.78.10"
+user = "root"
+password = "123456"
+key = "~/.ssh/id_ed25519_wzq"
+add_authorized_key = true
+
+
+interpreter = "/bin/bash"
+interpreter_flags = []
+
+block_home = "~/remote/blocks"
+script_home = "~/remote/scripts"
+
+file = [
+    { src = "~/.ssh/id_ed25519_wzq", dist = ":~/.ssh/id_ed25519_wzq", mode = "update" },
+    { src = "~/.ssh/id_ed25519_wzq.pub", dist = ":~/.ssh/id_ed25519_wzq.pub", mode = "update" },
+    { src = "~/.p10k.zsh", dist = ":~/.p10k.zsh", mode = "update" },
+    { src = "~/.tmux.conf", dist = ":~/.tmux.conf", mode = "update" },
+#    { src = "~/.config/nvim/init.lua", dist = ":~/.config/nvim/init.lua", mode = "update" },
+]
+
+script = [
+    { src = "install_uv.sh", mode = "init", flags = ["-i"] },
+    { src = "apt_packages.sh", mode = "init", flags = ["-i"] },
+    { src = "config_github.sh", mode = "init", flags = ["-i"] },
+    { src = "install_zsh.sh", mode = "init", flags = ["-i"] },
+    # { src = "install_codex.sh", mode = "init", flags = ["-i"] },
+]
+
+[block]
+dist = ":~/.zshrc"
+group_mode = "incremental"
+blocks = [
+    { src = "zsh.sh", mode = "cover" },
+    { src = "westlake_env.sh", mode = "cover" },
+    { src = "aliases.sh", mode = "cover" }
+]

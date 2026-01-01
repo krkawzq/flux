@@ -22,10 +22,6 @@ use cli::{connect, init, proxy as proxy_cli, status, sync as sync_cli};
     long_about = "Flux - A powerful tool for managing remote servers with configuration synchronization, SSH proxy tunnels, and more."
 )]
 struct Cli {
-    /// Enable verbose logging
-    #[arg(short, long, global = true)]
-    verbose: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -152,11 +148,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let log_level = if cli.verbose { "debug" } else { "info" };
+    // Note: --verbose controls script output streaming, not log level
+    // Default: only show WARN and ERROR from internal libs, INFO from our app
+    let default_filter = "warn,flux=info";
     tracing_subscriber::fmt()
+        .with_target(false)      // Don't show module path
+        .with_level(true)        // Show log level
+        .with_thread_ids(false)  // Don't show thread IDs
+        .with_file(false)        // Don't show file name
+        .with_line_number(false) // Don't show line number
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 

@@ -3,15 +3,15 @@
 use crate::cli::common::*;
 use crate::config::resolver::ConfigResolver;
 use crate::core::error::RemoteError;
+use crate::core::ssh::{append_ssh_config, SshConfigEntry};
 use crate::sync::block_sync::BlockSyncResult;
 use crate::sync::file_sync::FileSyncResult;
 use crate::sync::script_exec::ScriptExecResult;
 use crate::sync::service::{
-    load_sync_config, SyncCallbacks, SyncResult, SyncService, SyncServiceConfig,
+    SyncCallbacks, SyncResult, SyncService, SyncServiceConfig,
 };
 use comfy_table::Cell;
 use console::style;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// CLI callbacks for sync operations
@@ -148,20 +148,16 @@ impl SyncCallbacks for CliSyncCallbacks {
     }
 
     fn on_script_start(&self, script: &str) {
-        println!("  {} Running {}...", SCRIPT, style(script).cyan());
+        println!("  {} Executing: {}", SCRIPT, style(script).cyan());
     }
 
     fn on_script_end(&self, result: &ScriptExecResult) {
         self.script_count.fetch_add(1, Ordering::SeqCst);
 
         match result {
-            ScriptExecResult::Success { script, output } => {
-                println!("  {} {} completed", SUCCESS, style(script).green());
-                if !output.is_empty() {
-                    for line in output.lines().take(5) {
-                        println!("    {}", style(line).dim());
-                    }
-                }
+            ScriptExecResult::Success { script, output: _ } => {
+                // Output already streamed, just show completion
+                println!("  {} {} completed\n", SUCCESS, style(script).green());
             }
             ScriptExecResult::Skipped { script, reason } => {
                 println!(
@@ -174,19 +170,15 @@ impl SyncCallbacks for CliSyncCallbacks {
             ScriptExecResult::FailedAllowed {
                 script,
                 code,
-                stderr,
+                stderr: _,
             } => {
+                // Error output already streamed
                 println!(
-                    "  {} {} failed (exit {}) - allowed",
+                    "  {} {} failed (exit {}) - allowed\n",
                     WARNING,
                     style(script).yellow(),
                     code
                 );
-                if !stderr.is_empty() {
-                    for line in stderr.lines().take(3) {
-                        println!("    {}", style(line).red());
-                    }
-                }
             }
             ScriptExecResult::WouldExecute { script } => {
                 println!("  {} [dry-run] Would run {}", SCRIPT, style(script).cyan());
@@ -220,78 +212,14 @@ impl SyncCallbacks for CliSyncCallbacks {
     }
 }
 
-/// Run sync command
-pub async fn run_sync(
-    config_path: &str,
-    _ssh_config_name: Option<String>,
-    force_init: bool,
-    dry_run: bool,
-    conflict_override: Option<String>,
-) -> anyhow::Result<()> {
-    let config_path = PathBuf::from(config_path);
-
-    if !config_path.exists() {
-        print_error(&format!("Config file not found: {}", config_path.display()));
-        return Ok(());
-    }
-
-    println!(
-        "{} Loading config: {}",
-        INFO,
-        style(config_path.display()).cyan()
-    );
-
-    // Load config
-    let sync_config = load_sync_config(&config_path)?;
-
-    // Create service
-    let service_config = SyncServiceConfig {
-        force_init,
-        dry_run,
-        conflict_override,
-    };
-    let service = SyncService::new(service_config);
-
-    // Create callbacks
-    let callbacks = CliSyncCallbacks::new();
-
-    // Show dry-run banner
-    if dry_run {
-        println!();
-        print_warning("DRY-RUN MODE - No changes will be made");
-        println!();
-    }
-
-    // Run sync
-    println!();
-    println!("{}", style("=== File Sync ===").bold());
-
-    let result = service.sync(&sync_config, &callbacks).await;
-
-    match result {
-        Ok(_) => {
-            println!();
-            if dry_run {
-                print_info("Dry-run complete. Run without --dry-run to apply changes.");
-            }
-        }
-        Err(e) => {
-            print_error(&format!("{}", e));
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
-}
-
-/// Run sync command (new version with config name support)
+/// Run sync command with config name support
 pub async fn run_sync_v2(
     config_name: Option<String>,
     with_proxy: bool,
     force_init: bool,
     dry_run: bool,
     conflict_override: Option<String>,
-    _ssh_config_name: Option<String>,
+    ssh_config_name: Option<String>,
 ) -> anyhow::Result<()> {
     let resolver = ConfigResolver::new();
 
@@ -333,41 +261,56 @@ pub async fn run_sync_v2(
         print_warning("DRY-RUN MODE - No changes will be made");
     }
 
-    // For now, fall back to legacy sync if we find a config file path
-    // This maintains compatibility while we migrate
-    let finder = resolver.finder();
-    if let Ok(config_path) = finder.find(config_name_str) {
-        // Use legacy sync path
-        let sync_config = load_sync_config(&config_path)?;
+    // Create service with resolved config (always stream script output)
+    let service_config = SyncServiceConfig {
+        force_init,
+        dry_run,
+        verbose: true,  // Always stream output by default (like Python version)
+        conflict_override,
+    };
+    let service = SyncService::new(service_config);
+    let callbacks = CliSyncCallbacks::new();
 
-        let service_config = SyncServiceConfig {
-            force_init,
-            dry_run,
-            conflict_override,
-        };
-        let service = SyncService::new(service_config);
-        let callbacks = CliSyncCallbacks::new();
+    println!();
+    println!("{}", style("=== Sync Operations ===").bold());
 
-        println!();
-        println!("{}", style("=== File Sync ===").bold());
+    let result = service.sync(&flux_config, &callbacks).await;
 
-        let result = service.sync(&sync_config, &callbacks).await;
+    match result {
+        Ok(_) => {
+            println!();
+            if dry_run {
+                print_info("Dry-run complete. Run without --dry-run to apply changes.");
+            } else {
+                print_success("Sync complete!");
 
-        match result {
-            Ok(_) => {
-                println!();
-                if dry_run {
-                    print_info("Dry-run complete. Run without --dry-run to apply changes.");
+                // Save SSH config entry if requested
+                if let Some(alias) = ssh_config_name {
+                    let entry = SshConfigEntry {
+                        host_alias: alias.clone(),
+                        hostname: flux_config.connection.host.clone(),
+                        user: flux_config.connection.user.clone(),
+                        port: flux_config.connection.port,
+                        identity_file: flux_config.connection.key.clone(),
+                    };
+
+                    match append_ssh_config(&entry) {
+                        Ok(_) => {
+                            print_success(&format!("SSH config entry '{}' saved to ~/.ssh/config", alias));
+                            println!();
+                            print_info(&format!("You can now connect with: ssh {}", alias));
+                        }
+                        Err(e) => {
+                            print_warning(&format!("Failed to save SSH config: {}", e));
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                print_error(&format!("{}", e));
-                std::process::exit(1);
-            }
         }
-    } else {
-        print_error(&format!("Config not found: {}", config_name_str));
-        std::process::exit(1);
+        Err(e) => {
+            print_error(&format!("{}", e));
+            std::process::exit(1);
+        }
     }
 
     Ok(())

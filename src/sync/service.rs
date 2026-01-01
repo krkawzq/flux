@@ -6,10 +6,9 @@ use crate::core::error::{RemoteError, Result};
 use crate::core::ssh::{create_client, SshClient, SshClientTrait};
 use crate::sync::block_sync::{sync_block_groups, BlockSyncContext, BlockSyncResult};
 use crate::sync::file_sync::{sync_files, FileSyncContext, FileSyncResult};
-use crate::sync::models::SyncConfig;
+use crate::config::models::ResolvedConfig;
 use crate::sync::script_exec::{execute_scripts, ScriptExecContext, ScriptExecResult};
 use crate::sync::version::{generate_machine_id, VersionTracker};
-use std::path::PathBuf;
 
 /// Connection parameters tuple (host, user, port, key, password)
 type ConnectionParams = (String, String, u16, Option<String>, Option<String>);
@@ -48,6 +47,8 @@ pub struct SyncServiceConfig {
     pub force_init: bool,
     /// Dry run mode
     pub dry_run: bool,
+    /// Verbose mode - stream script output in real-time
+    pub verbose: bool,
     /// Conflict strategy override
     pub conflict_override: Option<String>,
 }
@@ -67,16 +68,20 @@ impl SyncService {
     /// Run sync with the given configuration
     pub async fn sync(
         &self,
-        sync_config: &SyncConfig,
+        resolved_config: &ResolvedConfig,
         callbacks: &dyn SyncCallbacks,
     ) -> Result<SyncResult> {
-        // Resolve connection parameters
-        let (host, user, port, key, password) = self.resolve_connection(sync_config)?;
+        // Get connection parameters from resolved config
+        let host = resolved_config.connection.host.clone();
+        let user = resolved_config.connection.user.clone();
+        let port = resolved_config.connection.port;
+        let key_str = resolved_config.connection.key.as_ref().map(|p| p.to_string_lossy().to_string());
+        let password = resolved_config.connection.password.clone();
 
         callbacks.on_connecting(&host);
 
         // Create SSH client
-        let client = create_client(&host, &user, port, key.as_deref(), password.as_deref());
+        let client = create_client(&host, &user, port, key_str.as_deref(), password.as_deref());
 
         // Connect
         client.connect().await?;
@@ -99,7 +104,7 @@ impl SyncService {
         let result = self
             .run_sync_operations(
                 &client,
-                sync_config,
+                resolved_config,
                 &mut version_tracker,
                 is_first_connect,
                 callbacks,
@@ -132,7 +137,7 @@ impl SyncService {
     async fn run_sync_operations(
         &self,
         client: &SshClient,
-        sync_config: &SyncConfig,
+        resolved_config: &ResolvedConfig,
         version_tracker: &mut VersionTracker,
         is_first_connect: bool,
         callbacks: &dyn SyncCallbacks,
@@ -145,7 +150,7 @@ impl SyncService {
         };
 
         // 1. File sync
-        if !sync_config.files.is_empty() {
+        if !resolved_config.files.is_empty() {
             // Determine flux_dir for relative path resolution
             let flux_dir = crate::config::finder::ConfigFinder::new()
                 .local_dir()
@@ -159,7 +164,7 @@ impl SyncService {
                 flux_dir,
             };
 
-            result.files = sync_files(&sync_config.files, &mut ctx).await?;
+            result.files = sync_files(&resolved_config.files, &mut ctx).await?;
 
             for file_result in &result.files {
                 callbacks.on_file_sync(file_result);
@@ -167,7 +172,7 @@ impl SyncService {
         }
 
         // 2. Block sync
-        if let Some(ref block_group) = sync_config.block {
+        if !resolved_config.blocks.is_empty() {
             // Get flux_dir for relative block path resolution
             let flux_dir = crate::config::finder::ConfigFinder::new()
                 .local_dir()
@@ -176,13 +181,13 @@ impl SyncService {
             let mut ctx = BlockSyncContext {
                 client,
                 version_tracker,
-                block_home: sync_config.block_home.clone(),
+                block_home: resolved_config.block_home.clone(),
                 force_init: self.config.force_init,
                 dry_run: self.config.dry_run,
                 flux_dir,
             };
 
-            result.blocks = sync_block_groups(std::slice::from_ref(block_group), &mut ctx).await?;
+            result.blocks = sync_block_groups(&resolved_config.blocks, &mut ctx).await?;
 
             for block_result in &result.blocks {
                 callbacks.on_block_sync(block_result);
@@ -190,7 +195,7 @@ impl SyncService {
         }
 
         // 3. Script execution
-        if !sync_config.scripts.is_empty() {
+        if !resolved_config.scripts.is_empty() {
             // Get flux_dir for relative script path resolution
             let flux_dir = crate::config::finder::ConfigFinder::new()
                 .local_dir()
@@ -198,18 +203,19 @@ impl SyncService {
 
             let ctx = ScriptExecContext {
                 client,
-                global_env: &sync_config.env,
-                script_home: sync_config.script_home.clone(),
+                global_env: &resolved_config.env,
+                script_home: resolved_config.script_home.clone(),
                 is_first_connect,
                 dry_run: self.config.dry_run,
+                verbose: self.config.verbose,
                 flux_dir,
             };
 
-            for script in &sync_config.scripts {
+            for script in &resolved_config.scripts {
                 callbacks.on_script_start(&script.src);
             }
 
-            result.scripts = execute_scripts(&sync_config.scripts, &ctx).await?;
+            result.scripts = execute_scripts(&resolved_config.scripts, &ctx).await?;
 
             for script_result in &result.scripts {
                 callbacks.on_script_end(script_result);
@@ -219,39 +225,6 @@ impl SyncService {
         Ok(result)
     }
 
-    /// Resolve connection parameters from config
-    fn resolve_connection(&self, config: &SyncConfig) -> Result<ConnectionParams> {
-        let host = config
-            .host
-            .clone()
-            .ok_or_else(|| RemoteError::Config("Host is required".to_string()))?;
-
-        let user = config
-            .user
-            .clone()
-            .ok_or_else(|| RemoteError::Config("User is required".to_string()))?;
-
-        let port = config.port.unwrap_or(22);
-        let key = config.key.clone();
-        let password = config.password.clone();
-
-        Ok((host, user, port, key, password))
-    }
-}
-
-/// Load sync configuration from TOML file
-pub fn load_sync_config(path: &PathBuf) -> Result<SyncConfig> {
-    let content = std::fs::read_to_string(path).map_err(|e| RemoteError::InvalidConfig {
-        path: path.clone(),
-        reason: e.to_string(),
-    })?;
-
-    let config: SyncConfig = toml::from_str(&content).map_err(|e| RemoteError::InvalidConfig {
-        path: path.clone(),
-        reason: e.to_string(),
-    })?;
-
-    Ok(config)
 }
 
 #[cfg(test)]

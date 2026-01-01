@@ -17,6 +17,8 @@ pub struct ScriptExecContext<'a> {
     pub script_home: Option<String>,
     pub is_first_connect: bool,
     pub dry_run: bool,
+    /// Verbose mode - stream output in real-time
+    pub verbose: bool,
     /// .flux directory for resolving relative script paths
     pub flux_dir: Option<PathBuf>,
 }
@@ -88,8 +90,18 @@ async fn execute_one_script(
     tracing::info!("Executing script: {}", script.src);
     tracing::debug!("Command: {}", cmd);
 
-    // Execute
-    let result = ctx.client.exec(&cmd).await?;
+    // Execute - always stream output in real-time (like Python version)
+    let result = if ctx.verbose {
+        // Stream output in real-time
+        ctx.client.exec_streaming(
+            &cmd,
+            |line| print!("{}", line),  // stdout
+            |line| eprint!("{}", line), // stderr to stderr
+        ).await?
+    } else {
+        // Still capture for legacy compatibility
+        ctx.client.exec(&cmd).await?
+    };
 
     if result.exit_code != 0 {
         if script.allow_fail {

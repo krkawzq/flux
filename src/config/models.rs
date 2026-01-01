@@ -3,16 +3,42 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// Re-export sync models for compatibility
+pub use crate::sync::models::{
+    SyncMode, ConflictStrategy, BlockGroupMode, ScriptMode, ExecMode
+};
+
 /// Root configuration structure
+/// Supports both flat format (host = "...") and nested format ([connection] host = "...")
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FluxConfig {
     /// Inherit from another config file
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherit: Option<String>,
 
-    /// Connection settings
+    /// Connection settings (nested format)
     #[serde(default)]
     pub connection: ConnectionConfig,
+
+    // === Flat connection fields (override nested [connection] if present) ===
+    /// Host address (flat format)
+    #[serde(default)]
+    pub host: Option<String>,
+    /// SSH user (flat format)
+    #[serde(default)]
+    pub user: Option<String>,
+    /// SSH port (flat format)
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// SSH password (flat format)
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Path to SSH private key (flat format)
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Reference to SSH config host name (flat format)
+    #[serde(default)]
+    pub ssh_config: Option<String>,
 
     /// Proxy settings
     #[serde(default)]
@@ -33,6 +59,43 @@ pub struct FluxConfig {
     /// Global environment settings
     #[serde(default)]
     pub env: EnvConfig,
+
+    // === Additional sync settings ===
+    /// Block home directory (relative to .flux/)
+    #[serde(default)]
+    pub block_home: Option<String>,
+    
+    /// Script home directory (relative to .flux/)
+    #[serde(default)]
+    pub script_home: Option<String>,
+    
+    /// Whether to add public key to authorized_keys on first connect
+    #[serde(default)]
+    pub add_authorized_key: bool,
+}
+
+impl FluxConfig {
+    /// Get effective connection config (flat fields override nested)
+    pub fn effective_connection(&self) -> ConnectionConfig {
+        // For port, use flat field if set, otherwise nested, with fallback to 22
+        let port = self.port
+            .or(if self.connection.port != 0 { Some(self.connection.port) } else { None })
+            .unwrap_or(22);
+
+        // For user, use flat field if set, otherwise nested, with fallback to "root"
+        let user = self.user.clone()
+            .or(if !self.connection.user.is_empty() { Some(self.connection.user.clone()) } else { None })
+            .unwrap_or_else(|| "root".to_string());
+
+        ConnectionConfig {
+            host: self.host.clone().unwrap_or_else(|| self.connection.host.clone()),
+            user,
+            port,
+            key: self.key.clone().or_else(|| self.connection.key.clone()),
+            password: self.password.clone().or_else(|| self.connection.password.clone()),
+            ssh_config: self.ssh_config.clone().or_else(|| self.connection.ssh_config.clone()),
+        }
+    }
 }
 
 /// SSH connection configuration
@@ -243,84 +306,22 @@ impl Default for EnvConfig {
 
 // === Enums ===
 
-/// File synchronization mode
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum SyncMode {
-    /// Only sync if target doesn't exist
-    Init,
-    /// Sync if source is newer (default)
-    #[default]
-    Update,
-    /// Force overwrite target
-    Cover,
-    /// Bidirectional sync based on mtime
-    Sync,
-    /// Mirror mode - delete extra files
-    Mirror,
-}
-
-/// Conflict resolution strategy
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ConflictStrategy {
-    /// Reject and report error (default)
-    #[default]
-    Reject,
-    /// Force overwrite
-    Force,
-    /// Backup before overwriting
-    Backup,
-    /// Ask user interactively
-    Ask,
-    /// Attempt to merge
-    Merge,
-}
-
-/// Block group mode
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum BlockGroupMode {
-    /// Preserve unknown blocks (default)
-    #[default]
-    Incremental,
-    /// Delete unknown blocks
-    Overwrite,
-}
-
-/// Script execution timing
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ScriptMode {
-    /// Only on first connection
-    Init,
-    /// Every sync (default)
-    #[default]
-    Always,
-}
-
-/// Script execution method
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecMode {
-    /// Direct execution (default)
-    #[default]
-    Exec,
-    /// Source the script
-    Source,
-}
-
 // === Resolved Configuration ===
+// Note: Enums are re-exported from sync::models at the top of this file
 
 /// Fully resolved configuration (no placeholders)
+/// Uses sync-compatible types for direct use in sync operations
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub connection: ResolvedConnection,
     pub proxy: ProxyConfigSection,
-    pub files: Vec<FileSyncRule>,
-    pub blocks: Vec<BlockSyncRule>,
-    pub scripts: Vec<ScriptRule>,
-    pub env: EnvConfig,
+    pub files: Vec<crate::sync::models::FileSync>,
+    pub blocks: Vec<crate::sync::models::BlockGroup>,
+    pub scripts: Vec<crate::sync::models::ScriptExec>,
+    pub env: crate::sync::models::GlobalEnv,
+    pub block_home: Option<String>,
+    pub script_home: Option<String>,
+    pub add_authorized_key: bool,
 }
 
 /// Resolved connection (all values filled)

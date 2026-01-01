@@ -9,7 +9,6 @@
 use crate::config::finder::ConfigFinder;
 use crate::config::models::*;
 use crate::core::error::{RemoteError, Result};
-use regex::Regex;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -87,90 +86,103 @@ impl ConfigResolver {
 
     /// Resolve all variables in configuration
     fn resolve_config(&self, config: FluxConfig) -> Result<ResolvedConfig> {
-        // Resolve connection config
-        let host = self.resolve_value(&config.connection.host, "host", None)?;
-        let user = self.resolve_value(
-            &config.connection.user,
-            "user",
-            Some("root"),
-        )?;
-        let port_str = self.resolve_value(
-            &config.connection.port.to_string(),
-            "port",
-            Some("22"),
-        )?;
-        let port: u16 = port_str.parse().map_err(|_| {
-            RemoteError::Config(format!("Invalid port number: {}", port_str))
-        })?;
+        // Get effective connection (flat fields override nested)
+        let conn = config.effective_connection();
+
+        // Sensitive fields: prompt if empty, use directly if set
+        let host = self.prompt_if_empty(&conn.host, "Host", None)?;
+        let user = self.prompt_if_empty(&conn.user, "User", Some("root"))?;
+        let password = self.prompt_if_empty_optional(conn.password.as_deref(), "Password", None)?;
+
+        // Port - prompt if 0 (not set), default to 22
+        let port = if conn.port == 0 {
+            let port_str = self.prompt_if_empty("", "Port", Some("22"))?;
+            port_str.parse::<u16>().map_err(|_| {
+                RemoteError::Config(format!("Invalid port number: {}", port_str))
+            })?
+        } else {
+            conn.port
+        };
 
         // Expand key path
-        let key = config.connection.key.map(|k| expand_tilde(&k));
+        let key = conn.key.map(|k| expand_tilde(&k));
 
         let connection = ResolvedConnection {
             host,
             user,
             port,
             key,
-            password: config.connection.password,
+            password,
+        };
+
+        // Convert config models to sync models
+        let files = config.files.into_iter().map(|f| crate::sync::models::FileSync {
+            src: f.src,
+            dist: f.dist,
+            mode: f.mode,
+            conflict: f.conflict,
+            condition: f.condition,
+            excludes: f.excludes,
+        }).collect();
+
+        let blocks = config.blocks.into_iter().map(|b| crate::sync::models::BlockGroup {
+            dist: b.dist,
+            mode: b.mode,
+            blocks: b.blocks,
+        }).collect();
+
+        let scripts = config.scripts.into_iter().map(|s| crate::sync::models::ScriptExec {
+            src: s.src,
+            mode: s.mode,
+            exec_mode: s.exec_mode,
+            interpreter: s.interpreter,
+            flags: s.flags,
+            args: s.args,
+            allow_fail: s.allow_fail,
+        }).collect();
+
+        let env = crate::sync::models::GlobalEnv {
+            interpreter: config.env.interpreter,
+            flags: config.env.flags,
         };
 
         Ok(ResolvedConfig {
             connection,
             proxy: config.proxy,
-            files: config.files,
-            blocks: config.blocks,
-            scripts: config.scripts,
-            env: config.env,
+            files,
+            blocks,
+            scripts,
+            env,
+            block_home: config.block_home,
+            script_home: config.script_home,
+            add_authorized_key: config.add_authorized_key,
         })
     }
 
-    /// Resolve a single value with possible placeholder
-    fn resolve_value(
-        &self,
-        value: &str,
-        _var_name: &str,
-        hint_default: Option<&str>,
-    ) -> Result<String> {
-        // Check for placeholder pattern: {{name}} or {{name:default}}
-        let re = Regex::new(r"\{\{([^}:]+)(?::([^}]*))?\}\}").unwrap();
+    /// Prompt if value is empty (for required fields)
+    /// Shows default in brackets, waits for user input
+    fn prompt_if_empty(&self, value: &str, name: &str, default: Option<&str>) -> Result<String> {
+        // If value is not empty, use it directly
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
 
-        if let Some(caps) = re.captures(value) {
-            let placeholder_name = caps.get(1).unwrap().as_str();
-            let placeholder_default = caps.get(2).map(|m| m.as_str());
-
-            // Check pre-defined variables first
-            if let Some(preset) = self.variables.get(placeholder_name) {
-                return Ok(preset.clone());
-            }
-
-            // Determine default value
-            let default = placeholder_default.or(hint_default);
-
-            // Prompt for input if interactive
-            if self.interactive {
-                return self.prompt_variable(placeholder_name, default);
-            }
-
-            // Use default if available
+        // Only prompt if interactive mode is enabled
+        if !self.interactive {
+            // Non-interactive: use default if available, error otherwise
             if let Some(def) = default {
                 return Ok(def.to_string());
             }
-
             return Err(RemoteError::Config(format!(
-                "Missing required variable: {}",
-                placeholder_name
+                "{} is required but not provided",
+                name
             )));
         }
 
-        // No placeholder, return as-is
-        Ok(value.to_string())
-    }
-
-    /// Prompt user for variable input
-    fn prompt_variable(&self, name: &str, default: Option<&str>) -> Result<String> {
+        // Interactive mode: prompt user
         let prompt = match default {
-            Some(def) => format!("{} [{}]: ", capitalize(name), def),
-            None => format!("{}: ", capitalize(name)),
+            Some(def) => format!("{} [{}]: ", name, def),
+            None => format!("{}: ", name),
         };
 
         print!("{}", prompt);
@@ -180,17 +192,54 @@ impl ConfigResolver {
         io::stdin().read_line(&mut input)?;
         let input = input.trim();
 
+        // Empty input: use default or error
         if input.is_empty() {
             if let Some(def) = default {
                 return Ok(def.to_string());
             }
             return Err(RemoteError::Config(format!(
                 "{} is required",
-                capitalize(name)
+                name
             )));
         }
 
         Ok(input.to_string())
+    }
+
+    /// Prompt if value is empty (for optional fields like password)
+    fn prompt_if_empty_optional(&self, value: Option<&str>, name: &str, default: Option<&str>) -> Result<Option<String>> {
+        // If value is set and not empty, use it directly
+        if let Some(val) = value {
+            if !val.is_empty() {
+                return Ok(Some(val.to_string()));
+            }
+        }
+
+        // Only prompt if interactive mode is enabled
+        if !self.interactive {
+            // Non-interactive: use default if available, None otherwise
+            return Ok(default.map(|s| s.to_string()));
+        }
+
+        // Interactive mode: prompt user
+        let prompt = match default {
+            Some(def) => format!("{} [{}]: ", name, def),
+            None => format!("{} (optional, press Enter to skip): ", name),
+        };
+
+        print!("{}", prompt);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        // Empty input: use default or None
+        if input.is_empty() {
+            return Ok(default.map(|s| s.to_string()));
+        }
+
+        Ok(Some(input.to_string()))
     }
 
     /// Get the config finder
@@ -213,6 +262,10 @@ impl Default for ConfigResolver {
 /// - Files/Blocks/Scripts: child values extend parent (merge, not replace)
 /// - Env: child values override parent
 fn merge_configs(parent: FluxConfig, child: FluxConfig) -> FluxConfig {
+    // Get effective connection configs
+    let parent_conn = parent.effective_connection();
+    let child_conn = child.effective_connection();
+
     // Merge files: combine parent and child, child entries with same src override
     let mut merged_files = parent.files.clone();
     for child_file in child.files {
@@ -245,22 +298,19 @@ fn merge_configs(parent: FluxConfig, child: FluxConfig) -> FluxConfig {
 
     FluxConfig {
         inherit: None, // Already processed
-        connection: ConnectionConfig {
-            // Child host overrides parent (if not empty)
-            host: if child.connection.host.is_empty() {
-                parent.connection.host
-            } else {
-                child.connection.host
-            },
-            // Child user always wins (child explicitly set their user)
-            user: child.connection.user,
-            // Child port always wins (child explicitly set their port)
-            port: child.connection.port,
-            // Optional fields: child overrides if set
-            key: child.connection.key.or(parent.connection.key),
-            password: child.connection.password.or(parent.connection.password),
-            ssh_config: child.connection.ssh_config.or(parent.connection.ssh_config),
-        },
+        // Store merged connection in flat fields (preferred format)
+        host: Some(if child_conn.host.is_empty() {
+            parent_conn.host
+        } else {
+            child_conn.host
+        }),
+        user: Some(child_conn.user),
+        port: Some(child_conn.port),
+        key: child_conn.key.or(parent_conn.key),
+        password: child_conn.password.or(parent_conn.password),
+        ssh_config: child_conn.ssh_config.or(parent_conn.ssh_config),
+        // Clear nested connection (use flat fields)
+        connection: ConnectionConfig::default(),
         // Proxy: merge settings, child overrides individual fields
         proxy: ProxyConfigSection {
             enabled: child.proxy.enabled || parent.proxy.enabled,
@@ -297,6 +347,9 @@ fn merge_configs(parent: FluxConfig, child: FluxConfig) -> FluxConfig {
                 child.env.flags
             },
         },
+        block_home: child.block_home.or(parent.block_home),
+        script_home: child.script_home.or(parent.script_home),
+        add_authorized_key: child.add_authorized_key || parent.add_authorized_key,
     }
 }
 
@@ -316,15 +369,6 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Capitalize first letter
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,11 +377,5 @@ mod tests {
     fn test_expand_tilde() {
         let path = expand_tilde("~/.ssh/id_rsa");
         assert!(path.to_string_lossy().contains(".ssh"));
-    }
-
-    #[test]
-    fn test_capitalize() {
-        assert_eq!(capitalize("host"), "Host");
-        assert_eq!(capitalize(""), "");
     }
 }

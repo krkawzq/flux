@@ -4,7 +4,7 @@
 
 use crate::core::error::{RemoteError, Result};
 use crate::core::ssh::{SshClient, SshClientTrait};
-use crate::sync::models::{BlockGroup, BlockGroupMode, SyncMode, TextBlock};
+use crate::sync::models::{BlockGroup, BlockGroupMode};
 use crate::sync::version::{hash_content, VersionTracker};
 use regex::Regex;
 use std::collections::HashMap;
@@ -87,43 +87,38 @@ async fn sync_one_group(
     // Process each block in the group
     let mut new_blocks: Vec<(String, String)> = Vec::new(); // (name, content)
 
-    for block in &group.blocks {
-        let block_name = block.get_name();
+    for block_src in &group.blocks {
+        // Use file name (without extension) as block name
+        let block_name = std::path::Path::new(block_src)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(block_src)
+            .to_string();
 
         // Read local block content
-        let local_content = read_local_block(block, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
+        let local_content = read_local_block_file(block_src, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
         let local_hash = hash_content(&local_content);
-        let local_mtime = get_latest_mtime(&block.src, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
+        let local_mtime = get_file_mtime(block_src, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
 
         // Check if block already exists in remote
         let existing = existing_blocks.get(&block_name);
 
-        let should_update = match &block.mode {
-            SyncMode::Init => {
-                // Only sync if block doesn't exist
-                existing.is_none() || ctx.force_init
-            }
-            SyncMode::Update => {
-                // Sync if local is newer
-                match existing {
-                    Some(eb) => {
-                        // Check for conflict: remote was modified manually
-                        if eb.hash != local_hash && eb.mtime > local_mtime {
-                            // Remote was modified after our last sync
-                            results.push(BlockSyncResult::Conflict {
-                                name: block_name.clone(),
-                                local_hash: local_hash.clone(),
-                                remote_hash: eb.hash.clone(),
-                            });
-                            continue;
-                        }
-                        local_mtime > eb.mtime || local_hash != eb.hash
-                    }
-                    None => true,
+        // Default to Update mode for simple string format
+        let should_update = match existing {
+            Some(eb) => {
+                // Check for conflict: remote was modified manually
+                if eb.hash != local_hash && eb.mtime > local_mtime {
+                    // Remote was modified after our last sync
+                    results.push(BlockSyncResult::Conflict {
+                        name: block_name.clone(),
+                        local_hash: local_hash.clone(),
+                        remote_hash: eb.hash.clone(),
+                    });
+                    continue;
                 }
+                local_mtime > eb.mtime || local_hash != eb.hash
             }
-            SyncMode::Cover => true,
-            _ => true,
+            None => true,
         };
 
         if !should_update {
@@ -143,7 +138,7 @@ async fn sync_one_group(
             // Add block to new_blocks
             let formatted = format_block(
                 &block_name,
-                &block.src.join(","),
+                block_src,
                 local_mtime,
                 &local_hash,
                 &local_content,
@@ -238,50 +233,46 @@ fn resolve_block_path(src: &str, block_home: Option<&str>, flux_dir: Option<&Pat
     }
 }
 
-/// Read local block content from source files
-fn read_local_block(block: &TextBlock, block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<String> {
-    let mut content = String::new();
+/// Read local block content from a single source file
+fn read_local_block_file(src: &str, block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<String> {
+    let path = resolve_block_path(src, block_home, flux_dir);
 
-    for src in &block.src {
-        let path = resolve_block_path(src, block_home, flux_dir);
-
-        let file_content = fs::read_to_string(&path).map_err(|e| {
-            RemoteError::Sync(format!(
-                "Failed to read block source {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&file_content);
-    }
+    let content = fs::read_to_string(&path).map_err(|e| {
+        RemoteError::Sync(format!(
+            "Failed to read block source {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
 
     Ok(content)
 }
 
-/// Get latest mtime from source files
-fn get_latest_mtime(sources: &[String], block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<i64> {
-    let mut latest: i64 = 0;
+/// Get mtime from a single source file
+fn get_file_mtime(src: &str, block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<i64> {
+    let path = resolve_block_path(src, block_home, flux_dir);
 
-    for src in sources {
-        let path = resolve_block_path(src, block_home, flux_dir);
+    let metadata = fs::metadata(&path).map_err(|e| {
+        RemoteError::Sync(format!(
+            "Failed to get metadata for {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
 
-        if let Ok(metadata) = fs::metadata(&path) {
-            if let Ok(mtime) = metadata.modified() {
-                if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                    let ts = duration.as_secs() as i64;
-                    if ts > latest {
-                        latest = ts;
-                    }
-                }
-            }
-        }
-    }
+    let mtime = metadata.modified().map_err(|e| {
+        RemoteError::Sync(format!(
+            "Failed to get mtime for {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
 
-    Ok(latest)
+    let duration = mtime.duration_since(std::time::UNIX_EPOCH).map_err(|e| {
+        RemoteError::Sync(format!("Invalid mtime: {}", e))
+    })?;
+
+    Ok(duration.as_secs() as i64)
 }
 
 /// Format a block with markers

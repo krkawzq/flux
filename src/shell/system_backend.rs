@@ -70,7 +70,7 @@ impl ShellBackend for SystemShellBackend {
     }
 
     fn is_available(&self) -> bool {
-        let (_shell, _) = self.get_shell();
+        let (shell, _) = self.get_shell();
 
         #[cfg(unix)]
         {

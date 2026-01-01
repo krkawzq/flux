@@ -58,7 +58,7 @@ pub struct FileSync {
     pub excludes: Vec<String>,
 }
 
-/// Text block for incremental config sync
+/// Text block for incremental config sync (legacy format with detailed options)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextBlock {
     /// Source file paths
@@ -78,6 +78,15 @@ impl TextBlock {
             .first().cloned()
             .unwrap_or_else(|| "unnamed".to_string())
     }
+
+    /// Create from a simple source path string
+    pub fn from_path(path: String) -> Self {
+        Self {
+            src: vec![path],
+            mode: SyncMode::default(),
+            conflict: ConflictStrategy::default(),
+        }
+    }
 }
 
 /// Block group - multiple blocks targeting one file
@@ -88,8 +97,10 @@ pub struct BlockGroup {
     /// Group mode: incremental or overwrite
     #[serde(default)]
     pub mode: BlockGroupMode,
-    /// Blocks in this group
-    pub blocks: Vec<TextBlock>,
+    /// Block source files (simple string array format)
+    /// Each string is a path relative to block_home
+    #[serde(default)]
+    pub blocks: Vec<String>,
 }
 
 /// Block group mode
@@ -207,39 +218,5 @@ pub struct SyncManifest {
     pub files: HashMap<String, FileVersion>,
 }
 
-// === Sync Configuration ===
-
-/// Complete sync configuration (parsed from TOML)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SyncConfig {
-    // Connection
-    pub host: Option<String>,
-    pub user: Option<String>,
-    pub port: Option<u16>,
-    pub password: Option<String>,
-    pub key: Option<String>,
-    pub ssh_config: Option<String>,
-
-    // Options
-    #[serde(default)]
-    pub add_authorized_key: bool,
-
-    // Paths
-    pub block_home: Option<String>,
-    pub script_home: Option<String>,
-
-    // Sync items
-    #[serde(default, rename = "file")]
-    pub files: Vec<FileSync>,
-
-    // Block configuration
-    pub block: Option<BlockGroup>,
-
-    // Scripts
-    #[serde(default, rename = "script")]
-    pub scripts: Vec<ScriptExec>,
-
-    // Global environment
-    #[serde(default)]
-    pub env: GlobalEnv,
-}
+// === Note: SyncConfig has been removed ===
+// Use crate::config::models::ResolvedConfig instead

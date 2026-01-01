@@ -35,7 +35,6 @@ impl UnixBackgroundService {
 
 impl BackgroundService for UnixBackgroundService {
     fn spawn_background(&self, name: &str, args: Vec<String>) -> Result<u32> {
-        use nix::sys::signal::{self, Signal};
         use nix::unistd::{fork, setsid, ForkResult};
         use std::os::unix::process::CommandExt;
 

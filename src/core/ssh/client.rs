@@ -28,6 +28,7 @@ pub struct SshConfig {
     pub port: u16,
     pub user: String,
     pub auth: AuthMethod,
+    pub fallback_password: Option<String>,  // Fallback to password if key fails
     pub timeout_secs: u64,
 }
 
@@ -38,6 +39,7 @@ impl SshConfig {
             port: 22,
             user: user.into(),
             auth: AuthMethod::None,
+            fallback_password: None,
             timeout_secs: 30,
         }
     }
@@ -187,10 +189,27 @@ impl SshClient {
                 .authenticate_password(&self.config.user, password)
                 .await
                 .map_err(|e| RemoteError::SshAuth(format!("Password auth failed: {}", e))),
-            AuthMethod::KeyFile { path, passphrase } => self
-                .authenticate_with_key(&mut session, path, passphrase.as_deref())
-                .await
-                .map_err(|e| e.0),
+            AuthMethod::KeyFile { path, passphrase } => {
+                let key_result = self
+                    .authenticate_with_key(&mut session, path, passphrase.as_deref())
+                    .await;
+                
+                match key_result {
+                    Ok(true) => Ok(true),
+                    Ok(false) | Err(_) => {
+                        // Key auth failed, try fallback password if available
+                        if let Some(ref fallback_pwd) = self.config.fallback_password {
+                            tracing::warn!("Key authentication failed, trying password fallback");
+                            session
+                                .authenticate_password(&self.config.user, fallback_pwd)
+                                .await
+                                .map_err(|e| RemoteError::SshAuth(format!("Password fallback auth failed: {}", e)))
+                        } else {
+                            key_result.map_err(|e| e.0)
+                        }
+                    }
+                }
+            }
             AuthMethod::None => session
                 .authenticate_none(&self.config.user)
                 .await
@@ -519,6 +538,7 @@ fn base64_decode(data: &str) -> std::result::Result<Vec<u8>, &'static str> {
 }
 
 /// Create an SSH client from configuration parameters
+/// Priority: key > password (with automatic fallback)
 pub fn create_client(
     host: &str,
     user: &str,
@@ -528,8 +548,21 @@ pub fn create_client(
 ) -> SshClient {
     let mut config = SshConfig::new(host, user).with_port(port);
 
+    // Prefer key if provided and file exists
     if let Some(key_path) = key {
-        config = config.with_key(key_path, None);
+        let expanded = crate::core::platform::expand_tilde(key_path);
+        if expanded.exists() {
+            config = config.with_key(key_path, None);
+            // Set password as fallback
+            if let Some(pwd) = password {
+                config.fallback_password = Some(pwd.to_string());
+            }
+        } else {
+            tracing::warn!("SSH key file not found: {}, using password auth", expanded.display());
+            if let Some(pwd) = password {
+                config = config.with_password(pwd);
+            }
+        }
     } else if let Some(pwd) = password {
         config = config.with_password(pwd);
     }

@@ -17,6 +17,8 @@ pub struct ScriptExecContext<'a> {
     pub script_home: Option<String>,
     pub is_first_connect: bool,
     pub dry_run: bool,
+    /// .flux directory for resolving relative script paths
+    pub flux_dir: Option<PathBuf>,
 }
 
 /// Result of script execution
@@ -135,6 +137,11 @@ fn build_remote_script_cmd(script: &ScriptExec, ctx: &ScriptExecContext<'_>) -> 
     Ok(cmd)
 }
 
+/// Check if path is relative (not starting with / or ~)
+fn is_relative_path(path: &str) -> bool {
+    !path.starts_with('/') && !path.starts_with('~') && !path.starts_with(':')
+}
+
 /// Build command for local script (upload first)
 async fn build_local_script_cmd(
     script: &ScriptExec,
@@ -142,8 +149,17 @@ async fn build_local_script_cmd(
 ) -> Result<String> {
     // Resolve local path
     let local_path = if let Some(ref home) = ctx.script_home {
+        // Explicit script_home takes precedence
         PathBuf::from(home).join(&script.src)
+    } else if is_relative_path(&script.src) {
+        // Relative path: resolve against .flux/scripts directory
+        if let Some(ref flux_dir) = ctx.flux_dir {
+            flux_dir.join("scripts").join(&script.src)
+        } else {
+            expand_tilde(&script.src)
+        }
     } else {
+        // Absolute or ~ path
         expand_tilde(&script.src)
     };
 
@@ -192,11 +208,11 @@ async fn build_local_script_cmd(
 fn detect_shebang(content: &str) -> Option<String> {
     let first_line = content.lines().next()?;
 
-    if first_line.starts_with("#!") {
-        let interpreter = first_line[2..].trim();
+    if let Some(interpreter) = first_line.strip_prefix("#!") {
+        let interpreter = interpreter.trim();
         // Handle "#!/usr/bin/env bash" style
-        if interpreter.starts_with("/usr/bin/env ") {
-            Some(interpreter[13..].trim().to_string())
+        if let Some(cmd) = interpreter.strip_prefix("/usr/bin/env ") {
+            Some(cmd.trim().to_string())
         } else {
             Some(interpreter.to_string())
         }

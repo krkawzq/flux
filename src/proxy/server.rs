@@ -333,7 +333,7 @@ async fn handle_http(
 async fn connect_target(
     host: &str,
     port: u16,
-    tunnel: Option<Arc<ForwardTunnel>>,
+    _tunnel: Option<Arc<ForwardTunnel>>,
 ) -> Result<TcpStream> {
     // TODO: If tunnel is provided, use it for connections
     // For now, connect directly

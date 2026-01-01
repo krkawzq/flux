@@ -2,7 +2,6 @@
 //!
 //! Provides periodic health monitoring and status reporting
 
-use crate::core::error::Result;
 use crate::core::ssh::{SshClient, SshClientTrait};
 use crate::proxy::models::{HealthCheckConfig, ProxyStatus};
 use std::sync::atomic::{AtomicBool, Ordering};

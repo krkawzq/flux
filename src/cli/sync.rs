@@ -1,6 +1,7 @@
 //! Sync CLI adapter
 
 use crate::cli::common::*;
+use crate::config::resolver::ConfigResolver;
 use crate::core::error::RemoteError;
 use crate::sync::block_sync::BlockSyncResult;
 use crate::sync::file_sync::FileSyncResult;
@@ -19,6 +20,12 @@ pub struct CliSyncCallbacks {
     file_count: AtomicUsize,
     block_count: AtomicUsize,
     script_count: AtomicUsize,
+}
+
+impl Default for CliSyncCallbacks {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CliSyncCallbacks {
@@ -187,7 +194,7 @@ impl SyncCallbacks for CliSyncCallbacks {
         }
     }
 
-    fn on_complete(&self, result: &SyncResult) {
+    fn on_complete(&self, _result: &SyncResult) {
         println!();
         print_success("Sync complete!");
 
@@ -216,7 +223,7 @@ impl SyncCallbacks for CliSyncCallbacks {
 /// Run sync command
 pub async fn run_sync(
     config_path: &str,
-    ssh_config_name: Option<String>,
+    _ssh_config_name: Option<String>,
     force_init: bool,
     dry_run: bool,
     conflict_override: Option<String>,
@@ -272,6 +279,95 @@ pub async fn run_sync(
             print_error(&format!("{}", e));
             std::process::exit(1);
         }
+    }
+
+    Ok(())
+}
+
+/// Run sync command (new version with config name support)
+pub async fn run_sync_v2(
+    config_name: Option<String>,
+    with_proxy: bool,
+    force_init: bool,
+    dry_run: bool,
+    conflict_override: Option<String>,
+    _ssh_config_name: Option<String>,
+) -> anyhow::Result<()> {
+    let resolver = ConfigResolver::new();
+
+    // Load configuration
+    let config_name_str = config_name.as_deref().unwrap_or("default");
+
+    println!(
+        "{} Loading config: {}",
+        INFO,
+        style(config_name_str).cyan()
+    );
+
+    let flux_config = resolver.load(config_name_str)?;
+
+    // Show connection info
+    println!(
+        "{} Target: {}@{}:{}",
+        CONNECT,
+        style(&flux_config.connection.user).cyan(),
+        style(&flux_config.connection.host).green(),
+        flux_config.connection.port
+    );
+
+    // Handle proxy forwarding
+    if with_proxy || flux_config.proxy.enabled {
+        println!(
+            "{} Proxy forwarding enabled (remote:{} -> local:{})",
+            TUNNEL,
+            flux_config.proxy.remote_port,
+            flux_config.proxy.local_port
+        );
+        // TODO: Start proxy tunnel before sync
+        print_warning("Proxy during sync not yet fully implemented");
+    }
+
+    // Show dry-run banner
+    if dry_run {
+        println!();
+        print_warning("DRY-RUN MODE - No changes will be made");
+    }
+
+    // For now, fall back to legacy sync if we find a config file path
+    // This maintains compatibility while we migrate
+    let finder = resolver.finder();
+    if let Ok(config_path) = finder.find(config_name_str) {
+        // Use legacy sync path
+        let sync_config = load_sync_config(&config_path)?;
+
+        let service_config = SyncServiceConfig {
+            force_init,
+            dry_run,
+            conflict_override,
+        };
+        let service = SyncService::new(service_config);
+        let callbacks = CliSyncCallbacks::new();
+
+        println!();
+        println!("{}", style("=== File Sync ===").bold());
+
+        let result = service.sync(&sync_config, &callbacks).await;
+
+        match result {
+            Ok(_) => {
+                println!();
+                if dry_run {
+                    print_info("Dry-run complete. Run without --dry-run to apply changes.");
+                }
+            }
+            Err(e) => {
+                print_error(&format!("{}", e));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print_error(&format!("Config not found: {}", config_name_str));
+        std::process::exit(1);
     }
 
     Ok(())

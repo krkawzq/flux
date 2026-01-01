@@ -75,8 +75,7 @@ impl TextBlock {
     /// Generate block name from first source path
     pub fn get_name(&self) -> String {
         self.src
-            .first()
-            .map(|s| s.clone())
+            .first().cloned()
             .unwrap_or_else(|| "unnamed".to_string())
     }
 }

@@ -1,0 +1,29 @@
+# A100 测试服务器配置
+
+# ========== 连接配置 ==========
+host = "172.16.78.10"
+user = "root"
+port = 33347
+key = "~/.ssh/id_ed25519_wzq"
+add_authorized_key = true
+
+# ========== 脚本环境 ==========
+interpreter = "/bin/bash"
+interpreter_flags = []
+
+block_home = ".flux/blocks"
+script_home = ".flux/scripts"
+
+# ========== 文件同步 (仅 SSH 密钥) ==========
+[[file]]
+src = "~/.ssh/id_ed25519_wzq"
+dist = ":~/.ssh/id_ed25519_wzq"
+mode = "update"
+
+[[file]]
+src = "~/.ssh/id_ed25519_wzq.pub"
+dist = ":~/.ssh/id_ed25519_wzq.pub"
+mode = "update"
+
+# 暂时禁用脚本，先测试基本连接
+# script = []

@@ -11,16 +11,15 @@ use crate::proxy::server::ProxyServer;
 use crate::proxy::tunnel::{ForwardTunnel, ReverseTunnel};
 use crate::state::FileStateStore;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Proxy service callbacks for UI feedback
 pub trait ProxyCallbacks: Send + Sync {
-    fn on_starting(&self, name: &str) {}
-    fn on_connected(&self, name: &str) {}
-    fn on_tunnel_established(&self, name: &str, remote_port: u16) {}
-    fn on_reconnecting(&self, name: &str, attempt: u32) {}
-    fn on_stopped(&self, name: &str) {}
-    fn on_error(&self, name: &str, error: &RemoteError) {}
+    fn on_starting(&self, _name: &str) {}
+    fn on_connected(&self, _name: &str) {}
+    fn on_tunnel_established(&self, _name: &str, _remote_port: u16) {}
+    fn on_reconnecting(&self, _name: &str, _attempt: u32) {}
+    fn on_stopped(&self, _name: &str) {}
+    fn on_error(&self, _name: &str, _error: &RemoteError) {}
 }
 
 /// Default no-op callbacks
@@ -181,7 +180,7 @@ impl ProxyService {
         self.state_store.save(name, &state)?;
 
         // Setup reconnection manager
-        let mut reconnect = ReconnectionManager::new(
+        let _reconnect = ReconnectionManager::new(
             config.reconnect.max_retries,
             config.reconnect.initial_delay_ms,
             config.reconnect.max_delay_ms,
@@ -189,7 +188,7 @@ impl ProxyService {
         );
 
         // Start health checker
-        let health_checker = Arc::new(HealthChecker::new(
+        let _health_checker = Arc::new(HealthChecker::new(
             config.health_check.clone(),
             client.clone(),
         ));
@@ -213,10 +212,10 @@ impl ProxyService {
     /// Run reverse tunnel mode
     async fn run_reverse_tunnel(
         &self,
-        name: &str,
+        _name: &str,
         client: Arc<SshClient>,
         config: ProxyConfig,
-        callbacks: &dyn ProxyCallbacks,
+        _callbacks: &dyn ProxyCallbacks,
     ) -> Result<()> {
         let tunnel_config = crate::proxy::models::TunnelConfig {
             remote_port: config.remote_port,
@@ -249,10 +248,10 @@ impl ProxyService {
     /// Run built-in proxy mode
     async fn run_builtin_proxy(
         &self,
-        name: &str,
+        _name: &str,
         client: Arc<SshClient>,
         config: ProxyConfig,
-        callbacks: &dyn ProxyCallbacks,
+        _callbacks: &dyn ProxyCallbacks,
     ) -> Result<()> {
         let local_port = config.local_port.unwrap_or(7890);
 

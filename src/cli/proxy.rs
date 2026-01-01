@@ -1,10 +1,11 @@
 //! Proxy CLI adapter
 
 use crate::cli::common::*;
+use crate::config::resolver::ConfigResolver;
 use crate::core::error::RemoteError;
 use crate::core::ssh::SshConfig;
 use crate::proxy::models::{ProxyConfig, ProxyMode, ProxyState, ProxyStatus};
-use crate::proxy::service::{DefaultProxyCallbacks, ProxyCallbacks, ProxyService};
+use crate::proxy::service::{ProxyCallbacks, ProxyService};
 use comfy_table::{Cell, Color};
 use console::style;
 
@@ -40,6 +41,99 @@ impl ProxyCallbacks for CliProxyCallbacks {
     }
 }
 
+/// Run proxy start command (new simplified version)
+pub async fn run_proxy_start_v2(
+    config_name: &str,
+    foreground: bool,
+    local_port_override: Option<u16>,
+    remote_port_override: Option<u16>,
+) -> anyhow::Result<()> {
+    let resolver = ConfigResolver::new();
+    let service = ProxyService::new();
+    let callbacks = CliProxyCallbacks;
+
+    // Load configuration
+    let config = resolver.load(config_name)?;
+
+    // Build proxy config with overrides
+    let remote_port = remote_port_override.unwrap_or(config.proxy.remote_port);
+    let local_port = local_port_override.or(Some(config.proxy.local_port));
+
+    let proxy_mode = match config.proxy.mode.to_lowercase().as_str() {
+        "http" => ProxyMode::Http,
+        _ => ProxyMode::Socks5,
+    };
+
+    let proxy_config = ProxyConfig {
+        remote_port,
+        local_port,
+        local_host: "127.0.0.1".to_string(),
+        mode: proxy_mode,
+        use_builtin: config.proxy.builtin,
+        ..Default::default()
+    };
+
+    // Build SSH config
+    let ssh_config = SshConfig::new(&config.connection.host, &config.connection.user)
+        .with_port(config.connection.port);
+
+    println!();
+    println!("{}", style("=== Proxy Configuration ===").bold());
+    println!("  Config:      {}", style(config_name).cyan());
+    println!("  Host:        {}", style(&config.connection.host).green());
+    println!("  Remote Port: {}", style(remote_port).green());
+    println!(
+        "  Local Port:  {}",
+        style(local_port.unwrap_or(7890)).green()
+    );
+    println!("  Mode:        {}", style(&config.proxy.mode).yellow());
+    println!(
+        "  Foreground:  {}",
+        if foreground {
+            style("yes").green()
+        } else {
+            style("no").dim()
+        }
+    );
+    println!();
+
+    match service
+        .start(
+            config_name,
+            &config.connection.host,
+            proxy_config,
+            ssh_config,
+            foreground,
+            &callbacks,
+        )
+        .await
+    {
+        Ok(state) => {
+            if foreground {
+                println!("Press Ctrl+C to stop the proxy...");
+            } else {
+                println!();
+                print_success(&format!("Proxy started in background (PID: {})", state.pid));
+                println!();
+                println!(
+                    "Use '{}' to check status",
+                    style("flux status").cyan()
+                );
+                println!(
+                    "Use '{}' to stop",
+                    style(format!("flux proxy stop {}", config_name)).cyan()
+                );
+            }
+        }
+        Err(e) => {
+            print_error(&format!("Failed to start proxy: {}", e));
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
 /// Run proxy start command
 pub async fn run_proxy_start(
     name: &str,
@@ -48,7 +142,7 @@ pub async fn run_proxy_start(
     mode: &str,
     builtin: bool,
     foreground: bool,
-    config_path: Option<String>,
+    _config_path: Option<String>,
 ) -> anyhow::Result<()> {
     let service = ProxyService::new();
     let callbacks = CliProxyCallbacks;
@@ -113,11 +207,11 @@ pub async fn run_proxy_start(
                 println!();
                 println!(
                     "Use '{}' to check status",
-                    style("remote proxy status").cyan()
+                    style("flux proxy status").cyan()
                 );
                 println!(
                     "Use '{}' to stop",
-                    style(format!("remote proxy stop {}", name)).cyan()
+                    style(format!("flux proxy stop {}", name)).cyan()
                 );
             }
         }
@@ -224,7 +318,7 @@ pub async fn run_proxy_restart(name: &str) -> anyhow::Result<()> {
     let callbacks = CliProxyCallbacks;
 
     // Get current state
-    let state = match service.get_state(name)? {
+    let _state = match service.get_state(name)? {
         Some(s) => s,
         None => {
             print_error(&format!("Proxy not found: {}", name));

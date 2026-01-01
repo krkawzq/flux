@@ -62,9 +62,15 @@ pub fn get_home_dir() -> Option<PathBuf> {
 
 /// Expand ~ in paths
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") || path == "~" {
+    if path == "~" {
+        // Single ~ returns home directory
         if let Some(home) = get_home_dir() {
-            return home.join(&path[2..]);
+            return home;
+        }
+    } else if let Some(stripped) = path.strip_prefix("~/") {
+        // ~/xxx joins path to home
+        if let Some(home) = get_home_dir() {
+            return home.join(stripped);
         }
     }
     PathBuf::from(path)

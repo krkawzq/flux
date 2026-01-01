@@ -33,7 +33,7 @@ pub const GLOBAL_START_MARKER: &str = "# ========== REMOTE MANAGED REGION START 
 pub const GLOBAL_END_MARKER: &str = "# ========== REMOTE MANAGED REGION END ==========";
 
 /// Application name for directories
-pub const APP_NAME: &str = "remote";
+pub const APP_NAME: &str = "flux";
 
 /// Get the data directory for the application
 pub fn get_data_dir() -> PathBuf {

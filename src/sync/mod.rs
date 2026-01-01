@@ -9,5 +9,3 @@ pub mod script_exec;
 pub mod service;
 pub mod version;
 
-pub use models::*;
-pub use service::SyncService;

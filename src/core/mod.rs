@@ -11,5 +11,3 @@ pub mod error;
 pub mod platform;
 pub mod ssh;
 
-pub use config::Config;
-pub use error::{RemoteError, Result};

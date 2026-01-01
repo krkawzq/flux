@@ -1,19 +1,26 @@
-//! CLI entry point for the remote tool
+//! CLI entry point for the flux tool
+
+// Allow dead code during development - these functions will be used as the project matures
+#![allow(dead_code)]
 
 use clap::{Parser, Subcommand};
 
 mod cli;
+mod config;
 mod core;
 mod proxy;
 mod shell;
 mod state;
 mod sync;
 
-use cli::{proxy as proxy_cli, sync as sync_cli};
+use cli::{connect, init, proxy as proxy_cli, status, sync as sync_cli};
 
 #[derive(Parser)]
-#[command(name = "remote")]
-#[command(author, version, about = "SSH remote server management tool", long_about = None)]
+#[command(name = "flux")]
+#[command(author, version, about = "SSH remote server management tool")]
+#[command(
+    long_about = "Flux - A powerful tool for managing remote servers with configuration synchronization, SSH proxy tunnels, and more."
+)]
 struct Cli {
     /// Enable verbose logging
     #[arg(short, long, global = true)]
@@ -25,14 +32,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sync remote server configuration
-    Sync {
-        /// Configuration file path (TOML)
-        config: String,
-
-        /// Save SSH configuration to ~/.ssh/config with specified Host name
+    /// Initialize .flux directory structure
+    Init {
+        /// Initialize global ~/.flux directory instead
         #[arg(long)]
-        ssh_config: Option<String>,
+        global: bool,
+
+        /// Don't create example files
+        #[arg(long)]
+        no_example: bool,
+    },
+
+    /// Show flux workspace info
+    Info,
+
+    /// Sync configuration to remote server
+    Sync {
+        /// Configuration name or path (default: "default")
+        config: Option<String>,
+
+        /// Enable proxy forwarding during sync
+        #[arg(short, long)]
+        proxy: bool,
 
         /// Force init mode (treat as first connection)
         #[arg(long)]
@@ -45,56 +66,63 @@ enum Commands {
         /// Override conflict strategy
         #[arg(long)]
         conflict: Option<String>,
+
+        /// Save SSH config entry with this name
+        #[arg(long)]
+        ssh_config: Option<String>,
     },
 
-    /// Manage SSH reverse proxy tunnels
+    /// Start or manage SSH proxy tunnels
     Proxy {
         #[command(subcommand)]
-        action: ProxyAction,
+        action: Option<ProxyAction>,
+
+        /// Configuration name (when starting without subcommand)
+        #[arg(value_name = "CONFIG")]
+        config: Option<String>,
+    },
+
+    /// Show status of all services
+    Status {
+        /// Show verbose information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Connect to remote server via SSH
+    Connect {
+        /// Configuration name or path
+        config: Option<String>,
+
+        /// Start proxy tunnel before connecting
+        #[arg(short, long)]
+        proxy: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum ProxyAction {
-    /// Start SSH proxy tunnel
+    /// Start proxy tunnel (alternative syntax)
     Start {
-        /// Proxy instance name (SSH config host name)
-        name: String,
-
-        /// Local proxy port
-        #[arg(short, long)]
-        local_port: Option<u16>,
-
-        /// Remote proxy port
-        #[arg(short, long, default_value = "1081")]
-        remote_port: u16,
-
-        /// Proxy mode: http or socks5
-        #[arg(short, long, default_value = "socks5")]
-        mode: String,
-
-        /// Use built-in proxy server
-        #[arg(short, long)]
-        builtin: bool,
+        /// Configuration name
+        config: String,
 
         /// Run in foreground
         #[arg(short, long)]
         foreground: bool,
 
-        /// Configuration file path
+        /// Override local port
         #[arg(short, long)]
-        config: Option<String>,
+        local_port: Option<u16>,
+
+        /// Override remote port
+        #[arg(short, long)]
+        remote_port: Option<u16>,
     },
 
-    /// Stop SSH proxy tunnel
+    /// Stop proxy tunnel
     Stop {
         /// Proxy instance name (default: stop all)
-        name: Option<String>,
-    },
-
-    /// Show proxy tunnel status
-    Status {
-        /// Proxy instance name (default: show all)
         name: Option<String>,
     },
 
@@ -133,53 +161,85 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
+        // Initialize .flux directory
+        Commands::Init { global, no_example } => {
+            init::run_init(global, no_example)?;
+        }
+
+        // Show workspace info
+        Commands::Info => {
+            init::run_info()?;
+        }
+
+        // Sync configuration
         Commands::Sync {
             config,
-            ssh_config,
+            proxy,
             force_init,
             dry_run,
             conflict,
+            ssh_config,
         } => {
-            sync_cli::run_sync(&config, ssh_config, force_init, dry_run, conflict).await?;
-        }
-        Commands::Proxy { action } => match action {
-            ProxyAction::Start {
-                name,
-                local_port,
-                remote_port,
-                mode,
-                builtin,
-                foreground,
+            sync_cli::run_sync_v2(
                 config,
-            } => {
-                proxy_cli::run_proxy_start(
-                    &name,
+                proxy,
+                force_init,
+                dry_run,
+                conflict,
+                ssh_config,
+            )
+            .await?;
+        }
+
+        // Proxy commands
+        Commands::Proxy { action, config } => {
+            match action {
+                // Subcommand style: flux proxy start/stop/logs
+                Some(ProxyAction::Start {
+                    config,
+                    foreground,
                     local_port,
                     remote_port,
-                    &mode,
-                    builtin,
-                    foreground,
-                    config,
-                )
-                .await?;
+                }) => {
+                    proxy_cli::run_proxy_start_v2(&config, foreground, local_port, remote_port)
+                        .await?;
+                }
+                Some(ProxyAction::Stop { name }) => {
+                    proxy_cli::run_proxy_stop(name).await?;
+                }
+                Some(ProxyAction::Restart { name }) => {
+                    proxy_cli::run_proxy_restart(&name).await?;
+                }
+                Some(ProxyAction::Logs {
+                    name,
+                    lines,
+                    follow,
+                }) => {
+                    proxy_cli::run_proxy_logs(&name, lines, follow).await?;
+                }
+
+                // Direct style: flux proxy <config>
+                None => {
+                    if let Some(config_name) = config {
+                        // Start proxy with config
+                        proxy_cli::run_proxy_start_v2(&config_name, false, None, None).await?;
+                    } else {
+                        // Show status
+                        status::run_status(false).await?;
+                    }
+                }
             }
-            ProxyAction::Stop { name } => {
-                proxy_cli::run_proxy_stop(name).await?;
-            }
-            ProxyAction::Status { name } => {
-                proxy_cli::run_proxy_status(name).await?;
-            }
-            ProxyAction::Restart { name } => {
-                proxy_cli::run_proxy_restart(&name).await?;
-            }
-            ProxyAction::Logs {
-                name,
-                lines,
-                follow,
-            } => {
-                proxy_cli::run_proxy_logs(&name, lines, follow).await?;
-            }
-        },
+        }
+
+        // Show status
+        Commands::Status { verbose } => {
+            status::run_status(verbose).await?;
+        }
+
+        // Connect via SSH
+        Commands::Connect { config, proxy } => {
+            connect::run_connect(config, proxy).await?;
+        }
     }
 
     Ok(())

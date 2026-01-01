@@ -6,7 +6,7 @@
 mod executor;
 mod system_backend;
 
-pub use executor::{ShellBackend, ShellExecutor, ShellOutput};
+pub use executor::ShellExecutor;
 
 /// Create a new shell executor with default backends
 pub fn create_executor() -> ShellExecutor {

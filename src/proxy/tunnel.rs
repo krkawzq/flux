@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 
 /// Tunnel statistics
 #[derive(Debug, Default)]
@@ -114,7 +113,7 @@ impl ReverseTunnel {
 
         // Connect to local target
         let local_addr = format!("{}:{}", local_host, local_port);
-        let local_stream = TcpStream::connect(&local_addr).await.map_err(|e| {
+        let _local_stream = TcpStream::connect(&local_addr).await.map_err(|e| {
             RemoteError::Tunnel(format!("Failed to connect to {}: {}", local_addr, e))
         })?;
 
@@ -164,7 +163,7 @@ pub struct TunnelConnection {
 
 impl TunnelConnection {
     /// Read data from the tunnel
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
         // TODO: Read from SSH channel
         Ok(0)
     }

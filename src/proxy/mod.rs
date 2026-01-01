@@ -8,5 +8,3 @@ pub mod server;
 pub mod service;
 pub mod tunnel;
 
-pub use models::*;
-pub use service::ProxyService;

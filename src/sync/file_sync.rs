@@ -1,12 +1,17 @@
 //! File synchronization logic
 //!
 //! Handles file sync between local and remote with various modes
+//!
+//! Path resolution rules:
+//! - Remote paths: prefixed with ":" (e.g., ":~/.bashrc")
+//! - Absolute paths: start with "/" or "~" (e.g., "~/.ssh/id_rsa")
+//! - Relative paths: resolved relative to .flux directory (e.g., "files/config.sh")
 
 use crate::core::error::{RemoteError, Result};
 use crate::core::platform::expand_tilde;
 use crate::core::ssh::{SshClient, SshClientTrait};
-use crate::sync::models::{ConflictStrategy, FileSync, SyncMode};
-use crate::sync::version::{hash_content, hash_file, VersionTracker};
+use crate::sync::models::{FileSync, SyncMode};
+use crate::sync::version::VersionTracker;
 use std::fs;
 use std::path::PathBuf;
 
@@ -20,9 +25,34 @@ pub fn strip_remote_prefix(path: &str) -> &str {
     path.strip_prefix(':').unwrap_or(path)
 }
 
-/// Resolve a local path (expand ~)
+/// Check if path is relative (not starting with / or ~)
+fn is_relative_path(path: &str) -> bool {
+    !path.starts_with('/') && !path.starts_with('~') && !path.starts_with(':')
+}
+
+/// Resolve a local path
+/// - Absolute or ~ paths: expand tilde
+/// - Relative paths: resolve relative to flux_dir (if provided)
 pub fn resolve_local_path(path: &str) -> PathBuf {
-    expand_tilde(path)
+    resolve_local_path_with_base(path, None)
+}
+
+/// Resolve a local path with optional base directory (for relative paths)
+/// Relative paths are resolved against .flux/files/ directory
+pub fn resolve_local_path_with_base(path: &str, flux_dir: Option<&PathBuf>) -> PathBuf {
+    if is_relative_path(path) {
+        // Relative path - resolve against .flux/files directory
+        if let Some(base) = flux_dir {
+            return base.join("files").join(path);
+        }
+        // Fall back to current directory if no flux_dir
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    } else {
+        // Absolute or ~ path
+        expand_tilde(path)
+    }
 }
 
 /// File sync context
@@ -31,6 +61,8 @@ pub struct FileSyncContext<'a> {
     pub version_tracker: &'a mut VersionTracker,
     pub force_init: bool,
     pub dry_run: bool,
+    /// .flux directory path for resolving relative paths
+    pub flux_dir: Option<PathBuf>,
 }
 
 /// Result of a file sync operation
@@ -73,17 +105,21 @@ pub async fn sync_one_file(
     let src_is_remote = is_remote_path(&file.src);
     let dst_is_remote = is_remote_path(&file.dist);
 
-    // Parse paths
+    // Parse paths - use flux_dir for relative paths
     let src_path = if src_is_remote {
         strip_remote_prefix(&file.src).to_string()
     } else {
-        resolve_local_path(&file.src).to_string_lossy().to_string()
+        resolve_local_path_with_base(&file.src, ctx.flux_dir.as_ref())
+            .to_string_lossy()
+            .to_string()
     };
 
     let dst_path = if dst_is_remote {
         strip_remote_prefix(&file.dist).to_string()
     } else {
-        resolve_local_path(&file.dist).to_string_lossy().to_string()
+        resolve_local_path_with_base(&file.dist, ctx.flux_dir.as_ref())
+            .to_string_lossy()
+            .to_string()
     };
 
     // Handle based on mode
@@ -149,7 +185,7 @@ pub async fn sync_one_file(
 
 /// Init mode: only sync if target doesn't exist
 async fn sync_init(
-    file: &FileSync,
+    _file: &FileSync,
     src: &str,
     dst: &str,
     src_is_remote: bool,
@@ -189,7 +225,7 @@ async fn sync_init(
 
 /// Update mode: sync if source is newer
 async fn sync_update(
-    file: &FileSync,
+    _file: &FileSync,
     src: &str,
     dst: &str,
     src_is_remote: bool,
@@ -262,7 +298,7 @@ async fn sync_cover(
 
 /// Bidirectional sync based on mtime
 async fn sync_bidirectional(
-    file: &FileSync,
+    _file: &FileSync,
     src: &str,
     dst: &str,
     src_is_remote: bool,
@@ -384,29 +420,63 @@ async fn transfer_file(
     dst_is_remote: bool,
     ctx: &FileSyncContext<'_>,
 ) -> Result<()> {
-    // TODO: Implement actual file transfer via SFTP
-    // For now, log the operation
     tracing::info!("Transfer: {} -> {}", src, dst);
 
     if !src_is_remote && dst_is_remote {
         // Upload: local -> remote
         tracing::debug!("Upload: {} -> {}", src, dst);
-        // TODO: client.sftp().put(src, dst)
+        let content = fs::read(src).map_err(|e| {
+            RemoteError::Sync(format!("Failed to read local file {}: {}", src, e))
+        })?;
+        
+        // Expand ~ in remote path
+        let remote_dst = expand_remote_tilde(dst, ctx.client).await?;
+        ctx.client.upload_file(&remote_dst, &content).await?;
     } else if src_is_remote && !dst_is_remote {
         // Download: remote -> local
         tracing::debug!("Download: {} -> {}", src, dst);
-        // TODO: client.sftp().get(src, dst)
+        
+        // Expand ~ in remote path
+        let remote_src = expand_remote_tilde(src, ctx.client).await?;
+        let content = ctx.client.download_file(&remote_src).await?;
+        
+        // Ensure parent directory exists
+        let dst_path = PathBuf::from(dst);
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dst_path, content)?;
     } else if !src_is_remote && !dst_is_remote {
         // Local copy
         let src_path = PathBuf::from(src);
         let dst_path = PathBuf::from(dst);
         if let Some(parent) = dst_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)?;
         }
         fs::copy(&src_path, &dst_path)?;
+    } else {
+        // Remote to remote copy (via temp local file)
+        tracing::debug!("Remote copy (via local): {} -> {}", src, dst);
+        let remote_src = expand_remote_tilde(src, ctx.client).await?;
+        let remote_dst = expand_remote_tilde(dst, ctx.client).await?;
+        
+        let content = ctx.client.download_file(&remote_src).await?;
+        ctx.client.upload_file(&remote_dst, &content).await?;
     }
 
     Ok(())
+}
+
+/// Expand ~ in remote path to actual home directory
+async fn expand_remote_tilde(path: &str, client: &SshClient) -> Result<String> {
+    if path.starts_with("~/") {
+        let home = client.get_home().await?;
+        Ok(format!("{}{}", home, &path[1..]))
+    } else if path == "~" {
+        client.get_home().await
+    } else {
+        Ok(path.to_string())
+    }
 }
 
 /// Ensure remote directory exists

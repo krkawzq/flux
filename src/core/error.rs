@@ -1,9 +1,9 @@
-//! Error types for the remote tool
+//! Error types for the flux tool
 
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Main error type for the remote tool
+/// Main error type for the flux tool
 #[derive(Error, Debug)]
 pub enum RemoteError {
     // === SSH Errors ===
@@ -15,6 +15,9 @@ pub enum RemoteError {
 
     #[error("SSH channel error: {0}")]
     SshChannel(String),
+
+    #[error("SSH command execution failed: {0}")]
+    SshExec(String),
 
     // === SFTP Errors ===
     #[error("SFTP operation failed: {0}")]

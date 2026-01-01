@@ -4,7 +4,7 @@
 
 use crate::core::error::{RemoteError, Result};
 use crate::core::ssh::{SshClient, SshClientTrait};
-use crate::sync::models::{BlockGroup, BlockGroupMode, ConflictStrategy, SyncMode, TextBlock};
+use crate::sync::models::{BlockGroup, BlockGroupMode, SyncMode, TextBlock};
 use crate::sync::version::{hash_content, VersionTracker};
 use regex::Regex;
 use std::collections::HashMap;
@@ -32,6 +32,8 @@ pub struct BlockSyncContext<'a> {
     pub block_home: Option<String>,
     pub force_init: bool,
     pub dry_run: bool,
+    /// .flux directory for resolving relative block paths
+    pub flux_dir: Option<std::path::PathBuf>,
 }
 
 /// Result of a block sync operation
@@ -89,9 +91,9 @@ async fn sync_one_group(
         let block_name = block.get_name();
 
         // Read local block content
-        let local_content = read_local_block(block, ctx.block_home.as_deref())?;
+        let local_content = read_local_block(block, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
         let local_hash = hash_content(&local_content);
-        let local_mtime = get_latest_mtime(&block.src, ctx.block_home.as_deref())?;
+        let local_mtime = get_latest_mtime(&block.src, ctx.block_home.as_deref(), ctx.flux_dir.as_ref())?;
 
         // Check if block already exists in remote
         let existing = existing_blocks.get(&block_name);
@@ -177,7 +179,7 @@ fn parse_remote_blocks(content: &str) -> HashMap<String, ParsedBlock> {
     let start_pattern =
         Regex::new(r"(?m)^# >>> remote-block:(.+?) src=(.+?) mtime=(\d+) hash=([a-f0-9]+) <<<$")
             .unwrap();
-    let end_pattern = Regex::new(r"(?m)^# <<< remote-block:(.+?) <<<\s*$").unwrap();
+    let _end_pattern = Regex::new(r"(?m)^# <<< remote-block:(.+?) <<<\s*$").unwrap();
 
     // Find all blocks
     for start_match in start_pattern.captures_iter(content) {
@@ -213,16 +215,35 @@ fn parse_remote_blocks(content: &str) -> HashMap<String, ParsedBlock> {
     blocks
 }
 
+/// Check if path is relative (not starting with / or ~)
+fn is_relative_path(path: &str) -> bool {
+    !path.starts_with('/') && !path.starts_with('~')
+}
+
+/// Resolve block source path
+fn resolve_block_path(src: &str, block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> PathBuf {
+    if let Some(home) = block_home {
+        // Explicit block_home takes precedence
+        PathBuf::from(home).join(src)
+    } else if is_relative_path(src) {
+        // Relative path: resolve against .flux/blocks directory
+        if let Some(flux_dir) = flux_dir {
+            flux_dir.join("blocks").join(src)
+        } else {
+            PathBuf::from(src)
+        }
+    } else {
+        // Absolute or ~ path
+        crate::core::platform::expand_tilde(src)
+    }
+}
+
 /// Read local block content from source files
-fn read_local_block(block: &TextBlock, block_home: Option<&str>) -> Result<String> {
+fn read_local_block(block: &TextBlock, block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<String> {
     let mut content = String::new();
 
     for src in &block.src {
-        let path = if let Some(home) = block_home {
-            PathBuf::from(home).join(src)
-        } else {
-            PathBuf::from(src)
-        };
+        let path = resolve_block_path(src, block_home, flux_dir);
 
         let file_content = fs::read_to_string(&path).map_err(|e| {
             RemoteError::Sync(format!(
@@ -242,15 +263,11 @@ fn read_local_block(block: &TextBlock, block_home: Option<&str>) -> Result<Strin
 }
 
 /// Get latest mtime from source files
-fn get_latest_mtime(sources: &[String], block_home: Option<&str>) -> Result<i64> {
+fn get_latest_mtime(sources: &[String], block_home: Option<&str>, flux_dir: Option<&PathBuf>) -> Result<i64> {
     let mut latest: i64 = 0;
 
     for src in sources {
-        let path = if let Some(home) = block_home {
-            PathBuf::from(home).join(src)
-        } else {
-            PathBuf::from(src)
-        };
+        let path = resolve_block_path(src, block_home, flux_dir);
 
         if let Ok(metadata) = fs::metadata(&path) {
             if let Ok(mtime) = metadata.modified() {
@@ -270,13 +287,8 @@ fn get_latest_mtime(sources: &[String], block_home: Option<&str>) -> Result<i64>
 /// Format a block with markers
 fn format_block(name: &str, src: &str, mtime: i64, hash: &str, content: &str) -> String {
     format!(
-        "{}\n{}\n{}",
-        format!(
-            "# >>> remote-block:{} src={} mtime={} hash={} <<<",
-            name, src, mtime, hash
-        ),
-        content.trim(),
-        format!("# <<< remote-block:{} <<<", name)
+        "# >>> remote-block:{} src={} mtime={} hash={} <<<\n{}\n# <<< remote-block:{} <<<",
+        name, src, mtime, hash, content.trim(), name
     )
 }
 

@@ -2,4 +2,4 @@
 
 mod client;
 
-pub use client::{create_client, AuthMethod, ExecResult, SshClient, SshClientTrait, SshConfig};
+pub use client::{create_client, SshClient, SshClientTrait, SshConfig};

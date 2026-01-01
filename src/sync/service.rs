@@ -3,13 +3,16 @@
 //! Main entry point for configuration synchronization
 
 use crate::core::error::{RemoteError, Result};
-use crate::core::ssh::{create_client, SshClient, SshClientTrait, SshConfig};
+use crate::core::ssh::{create_client, SshClient, SshClientTrait};
 use crate::sync::block_sync::{sync_block_groups, BlockSyncContext, BlockSyncResult};
 use crate::sync::file_sync::{sync_files, FileSyncContext, FileSyncResult};
-use crate::sync::models::{BlockGroup, FileSync, GlobalEnv, ScriptExec, SyncConfig};
+use crate::sync::models::SyncConfig;
 use crate::sync::script_exec::{execute_scripts, ScriptExecContext, ScriptExecResult};
 use crate::sync::version::{generate_machine_id, VersionTracker};
 use std::path::PathBuf;
+
+/// Connection parameters tuple (host, user, port, key, password)
+type ConnectionParams = (String, String, u16, Option<String>, Option<String>);
 
 /// Sync service result
 #[derive(Debug)]
@@ -22,16 +25,16 @@ pub struct SyncResult {
 
 /// Sync callbacks for UI feedback
 pub trait SyncCallbacks: Send + Sync {
-    fn on_connecting(&self, host: &str) {}
-    fn on_connected(&self, host: &str) {}
-    fn on_key_generated(&self, key_path: &str) {}
-    fn on_first_connect(&self, host: &str) {}
-    fn on_file_sync(&self, result: &FileSyncResult) {}
-    fn on_block_sync(&self, result: &BlockSyncResult) {}
-    fn on_script_start(&self, script: &str) {}
-    fn on_script_end(&self, result: &ScriptExecResult) {}
-    fn on_complete(&self, result: &SyncResult) {}
-    fn on_error(&self, error: &RemoteError) {}
+    fn on_connecting(&self, _host: &str) {}
+    fn on_connected(&self, _host: &str) {}
+    fn on_key_generated(&self, _key_path: &str) {}
+    fn on_first_connect(&self, _host: &str) {}
+    fn on_file_sync(&self, _result: &FileSyncResult) {}
+    fn on_block_sync(&self, _result: &BlockSyncResult) {}
+    fn on_script_start(&self, _script: &str) {}
+    fn on_script_end(&self, _result: &ScriptExecResult) {}
+    fn on_complete(&self, _result: &SyncResult) {}
+    fn on_error(&self, _error: &RemoteError) {}
 }
 
 /// Default no-op callbacks
@@ -39,6 +42,7 @@ pub struct DefaultCallbacks;
 impl SyncCallbacks for DefaultCallbacks {}
 
 /// Sync service configuration
+#[derive(Default)]
 pub struct SyncServiceConfig {
     /// Force init mode
     pub force_init: bool,
@@ -48,15 +52,6 @@ pub struct SyncServiceConfig {
     pub conflict_override: Option<String>,
 }
 
-impl Default for SyncServiceConfig {
-    fn default() -> Self {
-        Self {
-            force_init: false,
-            dry_run: false,
-            conflict_override: None,
-        }
-    }
-}
 
 /// Main sync service
 pub struct SyncService {
@@ -151,11 +146,17 @@ impl SyncService {
 
         // 1. File sync
         if !sync_config.files.is_empty() {
+            // Determine flux_dir for relative path resolution
+            let flux_dir = crate::config::finder::ConfigFinder::new()
+                .local_dir()
+                .cloned();
+
             let mut ctx = FileSyncContext {
                 client,
                 version_tracker,
                 force_init: self.config.force_init,
                 dry_run: self.config.dry_run,
+                flux_dir,
             };
 
             result.files = sync_files(&sync_config.files, &mut ctx).await?;
@@ -167,15 +168,21 @@ impl SyncService {
 
         // 2. Block sync
         if let Some(ref block_group) = sync_config.block {
+            // Get flux_dir for relative block path resolution
+            let flux_dir = crate::config::finder::ConfigFinder::new()
+                .local_dir()
+                .cloned();
+
             let mut ctx = BlockSyncContext {
                 client,
                 version_tracker,
                 block_home: sync_config.block_home.clone(),
                 force_init: self.config.force_init,
                 dry_run: self.config.dry_run,
+                flux_dir,
             };
 
-            result.blocks = sync_block_groups(&[block_group.clone()], &mut ctx).await?;
+            result.blocks = sync_block_groups(std::slice::from_ref(block_group), &mut ctx).await?;
 
             for block_result in &result.blocks {
                 callbacks.on_block_sync(block_result);
@@ -184,12 +191,18 @@ impl SyncService {
 
         // 3. Script execution
         if !sync_config.scripts.is_empty() {
+            // Get flux_dir for relative script path resolution
+            let flux_dir = crate::config::finder::ConfigFinder::new()
+                .local_dir()
+                .cloned();
+
             let ctx = ScriptExecContext {
                 client,
                 global_env: &sync_config.env,
                 script_home: sync_config.script_home.clone(),
                 is_first_connect,
                 dry_run: self.config.dry_run,
+                flux_dir,
             };
 
             for script in &sync_config.scripts {
@@ -207,10 +220,7 @@ impl SyncService {
     }
 
     /// Resolve connection parameters from config
-    fn resolve_connection(
-        &self,
-        config: &SyncConfig,
-    ) -> Result<(String, String, u16, Option<String>, Option<String>)> {
+    fn resolve_connection(&self, config: &SyncConfig) -> Result<ConnectionParams> {
         let host = config
             .host
             .clone()

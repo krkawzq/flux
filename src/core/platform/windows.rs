@@ -77,7 +77,7 @@ impl BackgroundService for WindowsBackgroundService {
         use winapi::um::handleapi::CloseHandle;
         use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
         use winapi::um::synchapi::WaitForSingleObject;
-        use winapi::um::winbase::INFINITE;
+        
         use winapi::um::winnt::{PROCESS_TERMINATE, SYNCHRONIZE};
 
         unsafe {

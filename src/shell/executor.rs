@@ -46,10 +46,9 @@ pub struct ShellExecutor {
 impl ShellExecutor {
     /// Create a new executor with default backends
     pub fn new() -> Self {
-        let mut backends: Vec<Box<dyn ShellBackend>> = vec![];
-
         // Add system shell backend (always available as primary fallback)
-        backends.push(Box::new(super::system_backend::SystemShellBackend::new()));
+        let backends: Vec<Box<dyn ShellBackend>> =
+            vec![Box::new(super::system_backend::SystemShellBackend::new())];
 
         Self {
             backends,
@@ -86,7 +85,7 @@ impl ShellExecutor {
             .iter()
             .find(|b| b.is_available())
             .map(|b| b.as_ref())
-            .ok_or_else(|| RemoteError::NoShellBackend)
+            .ok_or(RemoteError::NoShellBackend)
     }
 
     /// Execute a script string

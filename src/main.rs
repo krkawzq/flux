@@ -40,11 +40,11 @@ enum Commands {
         host: String,
 
         /// Local proxy port (your clash/v2ray port)
-        #[arg(short, long, default_value = "7890")]
+        #[arg(short, long, default_value = "7899")]
         local: u16,
 
         /// Remote listening port
-        #[arg(short, long, default_value = "1081")]
+        #[arg(short, long, default_value = "7890")]
         remote: u16,
 
         /// SSH private key path

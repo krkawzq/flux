@@ -87,11 +87,11 @@ pub struct ProxyConfig {
 }
 
 fn default_local_port() -> u16 {
-    7890
+    7899
 }
 
 fn default_remote_port() -> u16 {
-    1081
+    7890
 }
 
 fn default_protocol() -> String {

@@ -54,7 +54,7 @@ impl client::Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let state = self.state.lock().await;
-        let local_port = state.local_proxy_port.unwrap_or(7890);
+        let local_port = state.local_proxy_port.unwrap_or(7899);
         drop(state);
 
         // Spawn a task to handle this forwarded connection

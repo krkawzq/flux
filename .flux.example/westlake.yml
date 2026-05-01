@@ -1,0 +1,155 @@
+# Westlake 服务器配置
+
+# ========== SSH 连接配置 ==========
+host: "<REMOTE_HOST>"
+user: <REMOTE_USER>
+password: "<SSH_PASSWORD_OR_REMOVE_AND_USE_KEY>"
+key: ~/.ssh/id_ed25519_wzq
+register_key: true
+
+# ========== 全局设置 ==========
+interpreter: /bin/bash
+flags: ["-i"]
+comment_template: "# {}"
+
+# ========== Proxy 配置 ==========
+# proxy:
+#   enabled: true
+#   local_port: 7899
+#   remote_port: 1081
+#   protocol: http
+
+# ========== 文件同步 ==========
+file:
+  - name: ssh_key
+    src: ~/.ssh/id_ed25519_wzq
+    dst: :~/.ssh/id_ed25519_wzq
+    mode: sync
+    chmod: "600"
+
+  - name: ssh_key_pub
+    src: ~/.ssh/id_ed25519_wzq.pub
+    dst: :~/.ssh/id_ed25519_wzq.pub
+    mode: sync
+    chmod: "644"
+
+  - src: .p10k.zsh
+    dst: :~/.p10k.zsh
+    mode: sync
+
+  - src: .tmux.conf
+    dst: :~/.config/tmux/tmux.conf
+    mode: sync
+
+  - name: ghostty_terminfo
+    src: xterm-ghostty.terminfo
+    dst: :~/.flux-terminal/xterm-ghostty.terminfo
+    mode: sync
+
+  - name: opencode_config
+    src: opencode.json
+    dst: :~/.config/opencode/opencode.json
+    mode: sync
+
+  - name: opencode_auth
+    src: opencode_auth.json
+    dst: :~/.local/share/opencode/auth.json
+    mode: sync
+
+  - name: codex_config
+    src: codex_config.toml
+    dst: :~/.codex/config.toml
+    mode: sync
+
+  - name: codex_auth
+    src: codex_auth.json
+    dst: :~/.codex/auth.json
+    mode: sync
+
+  - name: claude_hud
+    src: claude-hud.config.json
+    dst: :~/.claude/plugins/claude-hud/config.json
+    mode: sync
+  
+  - name: claude_settings
+    src: claude_settings.json
+    dst: :~/.claude/settings.json
+    mode: sync
+  
+  - name: zellij_config
+    src: zellij.config.kdl
+    dst: :~/.config/zellij/config.kdl
+    mode: sync
+
+# ========== 脚本执行 ==========
+# 顺序说明:
+#   1. apt_packages    - 基础系统包（zsh, git, curl, clang 等）
+#   2. setup_language  - locale 设置（影响后续安装日志编码）
+#   3. install_uv      - Python 工具链 + 常用 Python 包
+#   4. config_github   - SSH/Git 配置（依赖 file sync 的密钥）
+#   5. install_zsh     - oh-my-zsh + p10k + 插件
+#   6. fix_permissions - 修复同步文件权限
+#   7. install_node    - NVM + Node.js（后续 AI 工具和 LSP 依赖）
+#   8. install_rust    - rustup + cargo + 国内镜像 + 常用组件
+#   9. install_nvim    - Neovim（依赖 git + GitHub SSH）
+#  10. setup_terminal  - xterm-ghostty terminfo + tmux 源码编译 + yazi + zellij
+#  11. install_lsp     - Language Servers（依赖 npm, cargo）
+#  12. install_ai_tools - Claude/OpenCode/Kimi/Codex（依赖 npm, curl）
+#  13. start_clash     - 启动 Clash 代理服务
+script:
+  - path: apt_packages.sh
+
+  - path: install_uv.sh
+
+  - path: config_github.sh
+
+  - path: install_zsh.sh
+
+  - path: fix_permissions.sh
+
+  - path: install_node.sh
+
+  - path: install_nvim.sh
+
+  - path: setup_terminal.sh
+
+  - path: install_lsp.sh
+
+  - path: start_clash.sh
+
+  - path: install_rust.sh
+
+  - path: setup_language.sh
+    interpreter: /bin/zsh
+  
+  - path: install_ai_tools.sh
+    interpreter: /bin/zsh
+  # - path: install_openclaw.sh
+
+# ========== 块同步 ==========
+
+block:
+  - name: zsh_config
+    path: zsh.sh
+    file: :~/.zshrc
+    mode: sync
+
+  - name: westlake_env
+    path: westlake_env.sh
+    file: :~/.zshrc
+    mode: sync
+
+  - name: aliases
+    path: aliases.sh
+    file: :~/.zshrc
+    mode: sync
+
+  - name: tools
+    path: tools.sh
+    file: :~/.zshrc
+    mode: sync
+
+  - name: variable
+    path: variable.sh
+    file: :~/.zshrc
+    mode: sync

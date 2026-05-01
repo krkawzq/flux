@@ -11,6 +11,8 @@ use crate::output::{self, Status};
 use crate::ssh::{SshClient, SshConfig};
 use anyhow::Result;
 use dialoguer::{Input, Password};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// SSH config info for saving to ~/.ssh/config
 pub struct SshConfigInfo {
@@ -22,14 +24,10 @@ pub struct SshConfigInfo {
 
 /// Run the sync pipeline
 pub async fn run_sync(config: Config, config_path: &std::path::Path) -> Result<SshConfigInfo> {
-    // Resolve .flux directory from config path
-    let flux_dir = config_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from(".flux"));
+    config.validate()?;
 
     // Preprocess config paths - resolve relative paths to .flux subdirectories
-    let config = resolve_config_paths(config, &flux_dir);
+    let config = resolve_config_paths(config, config_path);
 
     // Resolve SSH connection parameters (with interactive prompts)
     let ssh_config = resolve_ssh_config(&config)?;
@@ -51,10 +49,17 @@ pub async fn run_sync(config: Config, config_path: &std::path::Path) -> Result<S
     let mut client = SshClient::connect(&ssh_config).await?;
     output::print_status(Status::Success, "SSH connection established");
 
+    let mut total_success = 0;
+    let mut total_failed = 0;
+    let mut total_skipped = 0;
+
     // Register key first (before proxy, so it always runs)
     if config.register_key {
         if let Some(key_path) = &config.key {
-            register_public_key(&client, key_path).await?;
+            if let Err(err) = register_public_key(&client, key_path).await {
+                output::print_warning(&format!("Failed to register public key: {}", err));
+                total_failed += 1;
+            }
         }
     }
 
@@ -91,13 +96,11 @@ pub async fn run_sync(config: Config, config_path: &std::path::Path) -> Result<S
     println!();
 
     // Phase 2: Sync pipeline
-    let mut total_success = 0;
-    let mut total_failed = 0;
-    let mut total_skipped = 0;
-
     // 2.1: File sync
+    let mut file_status = std::collections::HashMap::new();
     if !config.file.is_empty() {
-        let (file_results, file_status) = file::sync_files(&client, &config.file).await?;
+        let (file_results, statuses) = file::sync_files(&client, &config.file).await?;
+        file_status = statuses;
 
         for r in &file_results {
             match r.status {
@@ -108,28 +111,28 @@ pub async fn run_sync(config: Config, config_path: &std::path::Path) -> Result<S
         }
 
         println!();
+    }
 
-        // 2.2: Script execution
-        if !config.script.is_empty() {
-            let script_results = script::exec_scripts(
-                &client,
-                &config.script,
-                &file_status,
-                &config.interpreter,
-                &config.flags,
-            )
-            .await?;
+    // 2.2: Script execution
+    if !config.script.is_empty() {
+        let script_results = script::exec_scripts(
+            &client,
+            &config.script,
+            &file_status,
+            &config.interpreter,
+            &config.flags,
+        )
+        .await?;
 
-            for r in &script_results {
-                match r.status {
-                    Status::Success => total_success += 1,
-                    Status::Failed => total_failed += 1,
-                    Status::Skip => total_skipped += 1,
-                }
+        for r in &script_results {
+            match r.status {
+                Status::Success => total_success += 1,
+                Status::Failed => total_failed += 1,
+                Status::Skip => total_skipped += 1,
             }
-
-            println!();
         }
+
+        println!();
     }
 
     // 2.3: Block sync
@@ -248,20 +251,26 @@ async fn register_public_key(client: &SshClient, key_path: &str) -> Result<()> {
     }
 
     // Write public key to a temp file first, then append
-    let temp_path = "/tmp/.flux_pubkey_temp";
+    let pid = std::process::id();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp_path = format!("/tmp/.flux_pubkey_{}_{}", pid, nanos);
     client
-        .write_remote_file(temp_path, pub_key.as_bytes())
+        .write_remote_file(&temp_path, pub_key.as_bytes())
         .await?;
 
     // Append temp file to authorized_keys and set permissions
     let result = client
         .exec(&format!(
             "cat {} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f {}",
-            temp_path, temp_path
+            shell_quote(&temp_path),
+            shell_quote(&temp_path)
         ))
         .await?;
 
     if result.exit_code != 0 {
+        let _ = client
+            .exec(&format!("rm -f {}", shell_quote(&temp_path)))
+            .await;
         output::print_warning(&format!("Failed to append key: {}", result.stderr));
         return Ok(());
     }
@@ -285,7 +294,9 @@ fn expand_tilde(path: &str) -> String {
 }
 
 /// Resolve config paths - map relative paths to .flux subdirectories
-fn resolve_config_paths(mut config: Config, flux_dir: &std::path::Path) -> Config {
+fn resolve_config_paths(mut config: Config, config_path: &Path) -> Config {
+    let flux_dir = config.resolve_root(config_path);
+
     // Helper to resolve a local path
     let resolve_local = |path: &str, subdir: &str| -> String {
         // Skip remote paths (starting with :) and absolute paths
@@ -335,4 +346,12 @@ fn resolve_config_paths(mut config: Config, flux_dir: &std::path::Path) -> Confi
     }
 
     config
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }

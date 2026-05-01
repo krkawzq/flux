@@ -1,0 +1,15 @@
+{
+  "language": "en",
+  "gitStatus": {
+    "enabled": true,
+    "showDirty": true,
+    "showAheadBehind": true
+  },
+  "display": {
+    "showUsage": true,
+    "usageBarEnabled": true,
+    "modelFormat": "full",
+    "mergeGroups": []
+  },
+  "lineLayout": "expanded"
+}

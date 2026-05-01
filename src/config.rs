@@ -2,11 +2,14 @@
 //!
 //! Defines the YAML configuration structure for flux sync operations.
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Root configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     // === SSH Configuration ===
     /// SSH host address (interactive if missing)
@@ -34,7 +37,7 @@ pub struct Config {
     #[serde(default = "default_comment_template")]
     pub comment_template: String,
     /// Custom .flux directory path
-    pub flux_home: Option<String>,
+    pub flux_home: Option<PathBuf>,
 
     // === Proxy Configuration ===
     /// Proxy settings
@@ -71,6 +74,7 @@ fn default_comment_template() -> String {
 
 /// Proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Enable proxy
     #[serde(default)]
@@ -81,9 +85,9 @@ pub struct ProxyConfig {
     /// Remote listening port
     #[serde(default = "default_remote_port")]
     pub remote_port: u16,
-    /// Proxy protocol: socks or http
+    /// Proxy protocol: http or socks5
     #[serde(default = "default_protocol")]
-    pub protocol: String,
+    pub protocol: ProxyProtocol,
 }
 
 fn default_local_port() -> u16 {
@@ -94,12 +98,21 @@ fn default_remote_port() -> u16 {
     7890
 }
 
-fn default_protocol() -> String {
-    "socks".to_string()
+fn default_protocol() -> ProxyProtocol {
+    ProxyProtocol::default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocol {
+    #[default]
+    Http,
+    Socks5,
 }
 
 /// File sync item
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileItem {
     /// Identifier for script dependencies
     pub name: Option<String>,
@@ -116,6 +129,7 @@ pub struct FileItem {
 
 /// Script execution item
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptItem {
     /// Script path (local or remote with : prefix)
     pub path: String,
@@ -133,6 +147,7 @@ pub struct ScriptItem {
 
 /// Block sync item
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockItem {
     /// Block name (required, used in sentinel)
     pub name: String,
@@ -163,8 +178,10 @@ pub enum SyncMode {
 impl Config {
     /// Load configuration from YAML file
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_yaml::from_str(&content)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let config: Config = serde_yml::from_str(&content)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
         Ok(config)
     }
 
@@ -210,5 +227,61 @@ impl Config {
             name_or_path,
             name_or_path
         )
+    }
+
+    /// Resolve the effective root directory for relative config paths.
+    pub fn resolve_root(&self, config_path: &Path) -> PathBuf {
+        let config_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".flux"));
+
+        match &self.flux_home {
+            Some(flux_home) => resolve_path_root(flux_home, &config_dir),
+            None => config_dir,
+        }
+    }
+
+    /// Validate cross-reference integrity inside the loaded config.
+    pub fn validate(&self) -> Result<()> {
+        let file_names: HashSet<&str> = self
+            .file
+            .iter()
+            .filter_map(|item| item.name.as_deref())
+            .collect();
+
+        for script in &self.script {
+            for dependency in &script.dependencies {
+                if !file_names.contains(dependency.as_str()) {
+                    anyhow::bail!(
+                        "script '{}' references unknown dependency '{}'",
+                        script.path,
+                        dependency
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn resolve_path_root(path: &Path, base_dir: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    let expanded = if path_str == "~" || path_str.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let suffix = path_str.strip_prefix('~').unwrap_or("");
+            home.join(suffix.trim_start_matches('/'))
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
     }
 }

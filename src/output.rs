@@ -48,7 +48,9 @@ pub fn print_header(msg: &str) {
 
 /// Print flux status message
 pub fn print_status(status: Status, msg: &str) {
-    let styled_status = status.style().apply_to(format!("{} {}", status.symbol(), status.label()));
+    let styled_status = status
+        .style()
+        .apply_to(format!("{} {}", status.symbol(), status.label()));
     println!("{} {}", style("[flux]").cyan().bold(), styled_status);
     if !msg.is_empty() {
         println!("       {}", msg);
@@ -67,7 +69,9 @@ pub fn print_file(src: &str, dst: &str) {
 
 /// Print file sync result
 pub fn print_file_result(status: Status, reason: Option<&str>) {
-    let styled = status.style().apply_to(format!("{} {}", status.symbol(), status.label()));
+    let styled = status
+        .style()
+        .apply_to(format!("{} {}", status.symbol(), status.label()));
     match reason {
         Some(r) => println!("       {} ({})", styled, style(r).dim()),
         None => println!("       {}", styled),
@@ -76,12 +80,18 @@ pub fn print_file_result(status: Status, reason: Option<&str>) {
 
 /// Print script execution
 pub fn print_script(path: &str) {
-    println!("{} {}", style("[script]").magenta().bold(), style(path).white());
+    println!(
+        "{} {}",
+        style("[script]").magenta().bold(),
+        style(path).white()
+    );
 }
 
 /// Print script result
 pub fn print_script_result(status: Status, reason: Option<&str>) {
-    let styled = status.style().apply_to(format!("{} {}", status.symbol(), status.label()));
+    let styled = status
+        .style()
+        .apply_to(format!("{} {}", status.symbol(), status.label()));
     match reason {
         Some(r) => println!("         {} ({})", styled, style(r).dim()),
         None => println!("         {}", styled),
@@ -100,7 +110,9 @@ pub fn print_block(name: &str, file: &str) {
 
 /// Print block result
 pub fn print_block_result(status: Status, reason: Option<&str>) {
-    let styled = status.style().apply_to(format!("{} {}", status.symbol(), status.label()));
+    let styled = status
+        .style()
+        .apply_to(format!("{} {}", status.symbol(), status.label()));
     match reason {
         Some(r) => println!("        {} ({})", styled, style(r).dim()),
         None => println!("        {}", styled),
@@ -142,9 +154,5 @@ pub fn print_warning(msg: &str) {
 
 /// Print info message
 pub fn print_info(msg: &str) {
-    println!(
-        "{} {}",
-        style("[flux]").cyan().bold(),
-        style(msg).dim()
-    );
+    println!("{} {}", style("[flux]").cyan().bold(), style(msg).dim());
 }

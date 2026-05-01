@@ -1,0 +1,19 @@
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+notify = ["/bin/sh", "-c", "echo -e '\\a'"]
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+[features]
+image_generation = true
+
+[tui]
+status_line = [
+  "model-with-reasoning",
+  "current-dir",
+  "context-used",
+  "five-hour-limit",
+  "weekly-limit",
+  "total-input-tokens",
+  "total-output-tokens"
+]

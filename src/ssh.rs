@@ -4,9 +4,9 @@
 //! and reverse port forwarding.
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use russh::keys::*;
-use russh::*;
+use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKey};
+use russh::{client, Channel, ChannelMsg, Disconnect};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,14 +31,14 @@ struct ClientHandler {
     state: Arc<Mutex<HandlerState>>,
 }
 
-#[async_trait]
 impl client::Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
+        _server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
+        // TODO: implement strict host key verification once host key policy is defined.
         // Accept all server keys (like ssh -o StrictHostKeyChecking=no)
         Ok(true)
     }
@@ -109,7 +109,7 @@ async fn handle_forwarded_connection(
         tokio::select! {
             // Data from local (via mpsc) -> send to remote
             Some(data) = rx.recv() => {
-                if channel.data(&data[..]).await.is_err() {
+                if channel.data(Cursor::new(data)).await.is_err() {
                     break;
                 }
             }
@@ -206,13 +206,14 @@ impl SshClient {
     ) -> Result<bool> {
         let key_pair = load_secret_key(key_path, None)
             .context(format!("Failed to load private key: {}", key_path))?;
+        let key_pair = PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
 
         let result = session
-            .authenticate_publickey(user, Arc::new(key_pair))
+            .authenticate_publickey(user, key_pair)
             .await
             .context("Key authentication failed")?;
 
-        Ok(result)
+        Ok(result.success())
     }
 
     /// Authenticate with password
@@ -226,7 +227,7 @@ impl SshClient {
             .await
             .context("Password authentication failed")?;
 
-        Ok(result)
+        Ok(result.success())
     }
 
     /// Start reverse port forwarding
@@ -239,11 +240,11 @@ impl SshClient {
             state.local_proxy_port = Some(local_port);
         }
 
-        // Request port forwarding on 0.0.0.0 (like ssh -R 0.0.0.0:port:localhost:local_port)
+        // Request loopback-only port forwarding to match the user-facing safety expectation.
         // russh returns Ok(_) on success, Err on failure
         // The returned port number may be 0 when using a fixed port (not dynamic)
         self.session
-            .tcpip_forward("0.0.0.0", remote_port as u32)
+            .tcpip_forward("127.0.0.1", remote_port as u32)
             .await
             .context(format!(
                 "Port forwarding failed for port {}. \
@@ -318,6 +319,13 @@ impl SshClient {
             .await
             .context("Failed to execute command")?;
 
+        let mut stdin_writer = channel.make_writer();
+        let stdin_task = tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            tokio::io::copy(&mut stdin, &mut stdin_writer).await?;
+            stdin_writer.shutdown().await
+        });
+
         let mut exit_code = 0;
 
         loop {
@@ -339,6 +347,17 @@ impl SshClient {
                 Some(ChannelMsg::Eof) | None => break,
                 _ => {}
             }
+        }
+
+        if !stdin_task.is_finished() {
+            stdin_task.abort();
+        }
+
+        match stdin_task.await {
+            Ok(Ok(())) => {}
+            Err(e) if e.is_cancelled() => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(e) => return Err(anyhow::Error::new(e).context("stdin forwarding task failed")),
         }
 
         channel.close().await.ok();
@@ -377,7 +396,7 @@ impl SshClient {
             .context("Failed to start file upload")?;
 
         channel
-            .data(&content[..])
+            .data(Cursor::new(content))
             .await
             .context("Failed to send file data")?;
 

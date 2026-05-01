@@ -1,0 +1,17 @@
+model_provider = "crs"
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+# service_tier = "fast"
+notify = ["/bin/sh", "-c", "echo -e '\\a'"]
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "context-used", "five-hour-limit", "weekly-limit", "total-input-tokens", "total-output-tokens"]
+
+[model_providers.crs]
+name = "crs"
+base_url = "https://capi.quan2go.com/openai"
+wire_api = "responses"
+requires_openai_auth = true

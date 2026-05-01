@@ -29,10 +29,12 @@ pub async fn exec_scripts(
 
     for script in scripts {
         // Check dependencies
-        let deps_ok = script
-            .dependencies
-            .iter()
-            .all(|dep| file_status.get(dep).copied().unwrap_or(true));
+        let deps_ok = script.dependencies.iter().all(|dep| {
+            file_status
+                .get(dep)
+                .copied()
+                .expect("validated by Config::validate")
+        });
 
         if !deps_ok {
             output::print_script(&script.path);
@@ -78,10 +80,7 @@ async fn exec_script_inner(
     default_flags: &[String],
 ) -> Result<(Status, Option<String>)> {
     let path = FluxPath::parse(&script.path);
-    let interpreter = script
-        .interpreter
-        .as_deref()
-        .unwrap_or(default_interpreter);
+    let interpreter = script.interpreter.as_deref().unwrap_or(default_interpreter);
     let flags = script.flags.as_deref().unwrap_or(default_flags);
 
     let remote_script_path = if path.is_remote() {
@@ -91,7 +90,10 @@ async fn exec_script_inner(
 
         // Check if script exists
         if !client.file_exists(&remote_path).await? {
-            return Ok((Status::Failed, Some("script not found on remote".to_string())));
+            return Ok((
+                Status::Failed,
+                Some("script not found on remote".to_string()),
+            ));
         }
 
         remote_path
@@ -116,18 +118,18 @@ async fn exec_script_inner(
     };
 
     // Build command
-    let flags_str = flags.join(" ");
-    let args_str = script.args.join(" ");
-    let command = format!("{} {} {} {}", interpreter, flags_str, remote_script_path, args_str);
+    let mut command_parts = Vec::with_capacity(2 + flags.len() + script.args.len());
+    command_parts.push(shell_quote(interpreter));
+    command_parts.extend(flags.iter().map(|flag| shell_quote(flag)));
+    command_parts.push(shell_quote(&remote_script_path));
+    command_parts.extend(script.args.iter().map(|arg| shell_quote(arg)));
+    let command = command_parts.join(" ");
 
     // Execute with streaming output
     let exit_code = client.exec_interactive(&command).await?;
 
     if exit_code != 0 {
-        return Ok((
-            Status::Failed,
-            Some(format!("exit code: {}", exit_code)),
-        ));
+        return Ok((Status::Failed, Some(format!("exit code: {}", exit_code))));
     }
 
     Ok((Status::Success, None))
@@ -150,4 +152,12 @@ mod hex {
             .map(|b| format!("{:02x}", b))
             .collect()
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }

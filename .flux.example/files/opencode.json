@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openai": {
+      "options": {
+        "baseURL": "https://capi.quan2go.com/openai",
+        "apiKey": "<REPLACE_ME>"
+      }
+    },
+    "anthropic": {
+      "options": {
+        "baseURL": "https://codeyy.top/v1",
+        "apiKey": "<REPLACE_ME>"
+      },
+      "models": {
+        "claude-opus-4-6": {
+          "name": "claude-opus-4-6"
+        },
+        "claude-sonnet-4-6": {
+          "name": "claude-sonnet-4-6"
+        }
+      }
+    },
+    "xyun": {
+      "options": {
+        "baseURL": "http://www.xyuncode.cc/",
+        "apiKey": "<REPLACE_ME>"
+      },
+      "models": {
+        "gpt-5.4": {
+          "name": "gpt-5.4"
+        }
+      }
+    }
+  },
+  "model": "openai/gpt-5.4-fast",
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "threshold": 0.9,
+    "maxContext": 1000000
+  }
+}

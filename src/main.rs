@@ -8,8 +8,11 @@ mod path;
 mod ssh;
 mod sync;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "flux")]
@@ -132,7 +135,16 @@ fn save_ssh_config(name: &str, config: &sync::SshConfigInfo) -> anyhow::Result<(
     }
 
     // Read existing config
-    let existing = std::fs::read_to_string(&ssh_config_path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&ssh_config_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).context(format!(
+                "failed to read SSH config {}",
+                ssh_config_path.display()
+            ))
+        }
+    };
 
     // Check if host already exists and remove it
     let host_pattern = format!("Host {}", name);
@@ -151,7 +163,7 @@ fn save_ssh_config(name: &str, config: &sync::SshConfigInfo) -> anyhow::Result<(
             continue;
         }
         if skip_until_next_host {
-            if line.trim().starts_with("Host ") || line.trim().starts_with("# ") {
+            if line.trim().starts_with("Host ") {
                 skip_until_next_host = false;
             } else {
                 continue;
@@ -233,7 +245,7 @@ async fn run_proxy(
     }
 
     // Parse host - check SSH config first, then parse as address
-    let (user, hostname, port, key_from_config) = parse_ssh_host_with_config(host);
+    let (user, hostname, port, key_from_config) = parse_ssh_host_with_config(host)?;
 
     // Use key override if provided, otherwise use key from config or default paths
     let key_path = key_override
@@ -350,21 +362,55 @@ async fn run_proxy(
 
 /// Parse SSH host with config file support
 /// Returns (user, host, port, key_path)
-fn parse_ssh_host_with_config(input: &str) -> (String, String, u16, Option<String>) {
+fn parse_ssh_host_with_config(
+    input: &str,
+) -> anyhow::Result<(String, String, u16, Option<String>)> {
     // First try to read from ~/.ssh/config
-    if let Some(config) = read_ssh_config_entry(input) {
-        return config;
+    if let Some(config) = read_ssh_config_entry(input)? {
+        return Ok(config);
     }
 
     // Fallback to parsing the input string
-    let (user, host, port) = parse_ssh_host(input);
-    (user, host, port, None)
+    let (user, host, port) = parse_ssh_host(input)?;
+    Ok((user, host, port, None))
 }
 
 /// Read SSH config entry
-fn read_ssh_config_entry(name: &str) -> Option<(String, String, u16, Option<String>)> {
-    let config_path = dirs::home_dir()?.join(".ssh").join("config");
-    let content = std::fs::read_to_string(&config_path).ok()?;
+fn read_ssh_config_entry(
+    name: &str,
+) -> anyhow::Result<Option<(String, String, u16, Option<String>)>> {
+    let config_path = match dirs::home_dir() {
+        Some(home) => home.join(".ssh").join("config"),
+        None => return Ok(None),
+    };
+
+    let mut visited = HashSet::new();
+    read_ssh_config_entry_from(&config_path, name, &mut visited)
+}
+
+fn read_ssh_config_entry_from(
+    config_path: &Path,
+    name: &str,
+    visited: &mut HashSet<PathBuf>,
+) -> anyhow::Result<Option<(String, String, u16, Option<String>)>> {
+    let visit_key =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    if !visited.insert(visit_key) {
+        return Ok(None);
+    }
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).context(format!(
+                "failed to read SSH config {}",
+                config_path.display()
+            ))
+        }
+    };
+
+    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut in_target_host = false;
     let mut hostname = None;
@@ -375,35 +421,76 @@ fn read_ssh_config_entry(name: &str) -> Option<(String, String, u16, Option<Stri
     for line in content.lines() {
         let line = line.trim();
 
-        if line.to_lowercase().starts_with("host ") {
-            let host_pattern = line[5..].trim();
-            in_target_host = host_pattern == name;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if starts_with_keyword(line, "include") {
+            let patterns = line["include".len()..].split_whitespace();
+            for pattern in patterns {
+                for include_path in expand_include_pattern(pattern, base_dir)? {
+                    if let Some(entry) = read_ssh_config_entry_from(&include_path, name, visited)? {
+                        return Ok(Some(entry));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if starts_with_keyword(line, "match") {
+            eprintln!(
+                "Warning: unsupported SSH config Match block in {}: {}",
+                config_path.display(),
+                line
+            );
+            in_target_host = false;
+            continue;
+        }
+
+        if starts_with_keyword(line, "host") {
+            let host_patterns = line["host".len()..].split_whitespace().collect::<Vec<_>>();
+            if host_patterns.iter().any(|pattern| {
+                pattern.contains('*') || pattern.contains('?') || pattern.starts_with('!')
+            }) {
+                eprintln!(
+                    "Warning: unsupported SSH config Host pattern in {}: {}",
+                    config_path.display(),
+                    line
+                );
+            }
+            in_target_host = host_patterns.iter().any(|pattern| *pattern == name);
             continue;
         }
 
         if in_target_host {
-            let lower = line.to_lowercase();
-            if lower.starts_with("hostname ") {
-                hostname = Some(line[9..].trim().to_string());
-            } else if lower.starts_with("user ") {
-                user = Some(line[5..].trim().to_string());
-            } else if lower.starts_with("port ") {
-                port = line[5..].trim().parse().ok();
-            } else if lower.starts_with("identityfile ") {
-                identity_file = Some(expand_tilde(line[13..].trim()));
+            if starts_with_keyword(line, "hostname") {
+                hostname = Some(line["hostname".len()..].trim().to_string());
+            } else if starts_with_keyword(line, "user") {
+                user = Some(line["user".len()..].trim().to_string());
+            } else if starts_with_keyword(line, "port") {
+                let port_str = line["port".len()..].trim();
+                port = Some(parse_port(port_str).map_err(|err| {
+                    err.context(format!(
+                        "invalid Port in SSH config {} for host '{}'",
+                        config_path.display(),
+                        name
+                    ))
+                })?);
+            } else if starts_with_keyword(line, "identityfile") {
+                identity_file = Some(expand_tilde(line["identityfile".len()..].trim()));
             }
         }
     }
 
     // If we found hostname, we have a valid entry
-    hostname.map(|h| {
+    Ok(hostname.map(|h| {
         (
             user.unwrap_or_else(|| "root".to_string()),
             h,
             port.unwrap_or(22),
             identity_file,
         )
-    })
+    }))
 }
 
 /// Find default SSH key
@@ -425,8 +512,8 @@ fn find_default_key() -> Option<String> {
 }
 
 /// Parse SSH host string into (user, host, port)
-/// Supports: host, user@host, user@host:port
-fn parse_ssh_host(input: &str) -> (String, String, u16) {
+/// Supports: host, host:port, [ipv6], [ipv6]:port, user@host, user@[ipv6]:port
+fn parse_ssh_host(input: &str) -> anyhow::Result<(String, String, u16)> {
     let default_user = "root".to_string();
     let default_port = 22u16;
 
@@ -434,22 +521,167 @@ fn parse_ssh_host(input: &str) -> (String, String, u16) {
     if let Some(at_pos) = input.find('@') {
         let user = input[..at_pos].to_string();
         let rest = &input[at_pos + 1..];
-
-        // Check for port
-        if let Some(colon_pos) = rest.rfind(':') {
-            let host = rest[..colon_pos].to_string();
-            let port = rest[colon_pos + 1..].parse().unwrap_or(default_port);
-            (user, host, port)
-        } else {
-            (user, rest.to_string(), default_port)
-        }
-    } else if let Some(colon_pos) = input.rfind(':') {
-        // host:port format
-        let host = input[..colon_pos].to_string();
-        let port = input[colon_pos + 1..].parse().unwrap_or(default_port);
-        (default_user, host, port)
+        parse_host_and_port(rest, user, default_port)
     } else {
-        // Just hostname
-        (default_user, input.to_string(), default_port)
+        parse_host_and_port(input, default_user, default_port)
+    }
+}
+
+fn parse_host_and_port(
+    rest: &str,
+    user: String,
+    default_port: u16,
+) -> anyhow::Result<(String, String, u16)> {
+    if let Some(closing_bracket) = rest.find(']') {
+        if rest.starts_with('[') {
+            let host = rest[1..closing_bracket].to_string();
+            let remainder = &rest[closing_bracket + 1..];
+
+            if remainder.is_empty() {
+                return Ok((user, host, default_port));
+            }
+
+            if let Some(port_str) = remainder.strip_prefix(':') {
+                let port = parse_port(port_str)?;
+                return Ok((user, host, port));
+            }
+        }
+    }
+
+    if let Some(colon_pos) = rest.rfind(':') {
+        if !rest[..colon_pos].contains(':') {
+            let host = rest[..colon_pos].to_string();
+            let port = parse_port(&rest[colon_pos + 1..])?;
+            return Ok((user, host, port));
+        }
+    }
+
+    Ok((user, rest.to_string(), default_port))
+}
+
+fn parse_port(port_str: &str) -> anyhow::Result<u16> {
+    port_str
+        .parse::<u16>()
+        .map_err(|err| anyhow::anyhow!("invalid port '{}': {}", port_str, err))
+}
+
+fn starts_with_keyword(line: &str, keyword: &str) -> bool {
+    if line.len() <= keyword.len() {
+        return false;
+    }
+
+    let (prefix, remainder) = line.split_at(keyword.len());
+    prefix.eq_ignore_ascii_case(keyword)
+        && remainder.chars().next().is_some_and(char::is_whitespace)
+}
+
+fn expand_include_pattern(pattern: &str, base_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let expanded = PathBuf::from(expand_tilde(pattern));
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
+    };
+
+    if !contains_wildcards(&resolved) {
+        return Ok(vec![resolved]);
+    }
+
+    let components = resolved
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter(|component| component != &std::path::MAIN_SEPARATOR.to_string())
+        .collect::<Vec<_>>();
+
+    let mut results = Vec::new();
+    let mut current = if resolved.is_absolute() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        PathBuf::new()
+    };
+
+    expand_include_components(&mut current, &components, 0, &mut results)?;
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+fn expand_include_components(
+    current: &mut PathBuf,
+    components: &[String],
+    index: usize,
+    results: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    if index >= components.len() {
+        if current.exists() {
+            results.push(current.clone());
+        }
+        return Ok(());
+    }
+
+    let component = &components[index];
+    if component.is_empty() {
+        return expand_include_components(current, components, index + 1, results);
+    }
+
+    if contains_wildcards_str(component) {
+        let search_dir = if current.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            current.as_path()
+        };
+
+        for entry in std::fs::read_dir(search_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if wildcard_matches(component, &file_name) {
+                let previous = current.clone();
+                *current = previous.join(&file_name);
+                expand_include_components(current, components, index + 1, results)?;
+                *current = previous;
+            }
+        }
+    } else {
+        let previous = current.clone();
+        *current = if current.as_os_str().is_empty() {
+            PathBuf::from(component)
+        } else {
+            current.join(component)
+        };
+        expand_include_components(current, components, index + 1, results)?;
+        *current = previous;
+    }
+
+    Ok(())
+}
+
+fn contains_wildcards(path: &Path) -> bool {
+    path.to_string_lossy().contains(['*', '?'])
+}
+
+fn contains_wildcards_str(value: &str) -> bool {
+    value.contains('*') || value.contains('?')
+}
+
+fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
+    wildcard_matches_bytes(pattern.as_bytes(), candidate.as_bytes())
+}
+
+fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return candidate.is_empty();
+    }
+
+    match pattern[0] {
+        b'*' => {
+            wildcard_matches_bytes(&pattern[1..], candidate)
+                || (!candidate.is_empty() && wildcard_matches_bytes(pattern, &candidate[1..]))
+        }
+        b'?' => !candidate.is_empty() && wildcard_matches_bytes(&pattern[1..], &candidate[1..]),
+        ch => {
+            !candidate.is_empty()
+                && ch == candidate[0]
+                && wildcard_matches_bytes(&pattern[1..], &candidate[1..])
+        }
     }
 }

@@ -1,0 +1,2 @@
+export WANDB_API_KEY="<REPLACE_ME>"
+export HF_TOKEN="<REPLACE_ME>"

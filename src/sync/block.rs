@@ -8,6 +8,7 @@ use crate::path::FluxPath;
 use crate::ssh::SshClient;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Result of a block sync operation
@@ -74,6 +75,7 @@ async fn sync_block_inner(
         return Ok((Status::Failed, Some("block file not found".to_string())));
     }
     let block_content = std::fs::read_to_string(&local_path)?;
+    let local_mtime = get_local_mtime(&local_path)?;
 
     // Get remote file path
     let remote_path = dst.resolve_remote()?;
@@ -85,9 +87,8 @@ async fn sync_block_inner(
     }
 
     // Read remote file content
-    let remote_content = String::from_utf8_lossy(
-        &client.read_remote_file(&remote_path).await?
-    ).to_string();
+    let remote_content =
+        String::from_utf8_lossy(&client.read_remote_file(&remote_path).await?).to_string();
 
     // Get comment template
     let comment_template = block
@@ -96,14 +97,9 @@ async fn sync_block_inner(
         .unwrap_or(default_comment_template);
 
     // Generate sentinels
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
-    let (start_sentinel, end_sentinel) = generate_sentinels(
-        comment_template,
-        &block.name,
-        timestamp,
-    );
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let (start_sentinel, end_sentinel) =
+        generate_sentinels(comment_template, &block.name, timestamp);
 
     // Find existing block
     let existing_block = find_existing_block(&remote_content, comment_template, &block.name);
@@ -114,19 +110,21 @@ async fn sync_block_inner(
             return Ok((Status::Skip, Some("block exists, mode: touch".to_string())));
         }
         // Block exists and mode is sync -> check timestamp
-        (Some((_, existing_timestamp, existing_content)), SyncMode::Sync) => {
+        (Some((_, _, existing_content)), SyncMode::Sync) => {
             // Compare hash to see if content changed
             let existing_hash = compute_hash(existing_content.trim().as_bytes());
             let new_hash = compute_hash(block_content.trim().as_bytes());
-            
+
             if existing_hash == new_hash {
                 return Ok((Status::Skip, Some("content unchanged".to_string())));
             }
-            
-            // If remote timestamp is newer and content differs, check mode behavior
-            if let Some(ts) = existing_timestamp {
-                if *ts >= timestamp as i64 {
-                    return Ok((Status::Skip, Some("remote is newer, mode: sync".to_string())));
+
+            if let Some(remote_mtime) = client.get_mtime(&remote_path).await? {
+                if remote_mtime >= local_mtime {
+                    return Ok((
+                        Status::Skip,
+                        Some("remote is newer, mode: sync".to_string()),
+                    ));
                 }
             }
         }
@@ -179,84 +177,42 @@ fn find_existing_block(
     template: &str,
     name: &str,
 ) -> Option<(std::ops::Range<usize>, Option<i64>, String)> {
-    // Build regex pattern for start sentinel
-    // Template is like "# {}", we need to match "# >>> name:timestamp >>>"
-    let prefix = template.split("{}").next().unwrap_or("");
-    let suffix = template.split("{}").last().unwrap_or("");
-    
-    let _start_pattern = format!(
-        r"{}>>> {}:(\d+) >>>{}",
-        regex_escape(prefix.trim()),
-        regex_escape(name),
-        regex_escape(suffix.trim())
-    );
-    let _end_pattern = format!(
-        r"{}<<< {}:\d+ <<<{}",
-        regex_escape(prefix.trim()),
-        regex_escape(name),
-        regex_escape(suffix.trim())
-    );
-
-    // Simple line-by-line search
-    let lines: Vec<&str> = content.lines().collect();
+    let line_infos = collect_lines_with_offsets(content);
     let mut start_line = None;
     let mut start_timestamp = None;
     let mut end_line = None;
 
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains(&format!(">>> {}:", name)) && line.contains(">>>") {
+    for (i, line_info) in line_infos.iter().enumerate() {
+        if let Some((true, ts)) = parse_sentinel_line(line_info.content, template, name) {
             start_line = Some(i);
-            // Extract timestamp
-            if let Some(ts_start) = line.find(&format!("{}:", name)) {
-                let rest = &line[ts_start + name.len() + 1..];
-                if let Some(ts_end) = rest.find(' ') {
-                    start_timestamp = rest[..ts_end].parse::<i64>().ok();
-                }
-            }
+            start_timestamp = Some(ts);
         }
-        if start_line.is_some() && line.contains(&format!("<<< {}:", name)) && line.contains("<<<") {
+        if start_line.is_some()
+            && matches!(
+                parse_sentinel_line(line_info.content, template, name),
+                Some((false, _))
+            )
+        {
             end_line = Some(i);
             break;
         }
     }
 
     if let (Some(start), Some(end)) = (start_line, end_line) {
-        // Calculate byte range
-        let mut byte_start = 0;
-        let mut byte_end = 0;
-        let mut current_pos = 0;
-
-        for (i, line) in lines.iter().enumerate() {
-            if i == start {
-                byte_start = current_pos;
-            }
-            current_pos += line.len() + 1; // +1 for newline
-            if i == end {
-                byte_end = current_pos;
-                break;
-            }
-        }
+        let byte_start = line_infos[start].start;
+        let byte_end = line_infos[end].end;
 
         // Extract content between sentinels
-        let block_content: String = lines[start + 1..end].join("\n");
+        let block_content: String = line_infos[start + 1..end]
+            .iter()
+            .map(|line| line.content)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         return Some((byte_start..byte_end, start_timestamp, block_content));
     }
 
     None
-}
-
-/// Escape special regex characters
-fn regex_escape(s: &str) -> String {
-    let special_chars = ['\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$'];
-    let mut result = String::new();
-    for c in s.chars() {
-        if special_chars.contains(&c) {
-            result.push('\\');
-        }
-        result.push(c);
-    }
-    result
 }
 
 /// Compute SHA256 hash
@@ -265,4 +221,71 @@ fn compute_hash(content: &[u8]) -> String {
     hasher.update(content);
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn get_local_mtime(path: &Path) -> Result<i64> {
+    let metadata = std::fs::metadata(path)?;
+    let mtime = metadata.modified()?;
+    let duration = mtime.duration_since(UNIX_EPOCH)?;
+    Ok(duration.as_secs() as i64)
+}
+
+struct LineInfo<'a> {
+    content: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn collect_lines_with_offsets(content: &str) -> Vec<LineInfo<'_>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+
+    for segment in content.split_inclusive('\n') {
+        let end = start + segment.len();
+        let content = segment.trim_end_matches(['\n', '\r']);
+        lines.push(LineInfo {
+            content,
+            start,
+            end,
+        });
+        start = end;
+    }
+
+    if start < content.len() {
+        lines.push(LineInfo {
+            content: &content[start..],
+            start,
+            end: content.len(),
+        });
+    }
+
+    lines
+}
+
+fn parse_sentinel_line(line: &str, template: &str, name: &str) -> Option<(bool, i64)> {
+    let (prefix, suffix) = template.split_once("{}")?;
+    let trimmed = line.trim();
+
+    if !trimmed.starts_with(prefix) || !trimmed.ends_with(suffix) {
+        return None;
+    }
+
+    let inner = &trimmed[prefix.len()..trimmed.len() - suffix.len()];
+    let inner = inner.trim();
+
+    if let Some(timestamp) = inner
+        .strip_prefix(&format!(">>> {}:", name))
+        .and_then(|rest| rest.strip_suffix(" >>>"))
+    {
+        return timestamp.trim().parse::<i64>().ok().map(|ts| (true, ts));
+    }
+
+    if let Some(timestamp) = inner
+        .strip_prefix(&format!("<<< {}:", name))
+        .and_then(|rest| rest.strip_suffix(" <<<"))
+    {
+        return timestamp.trim().parse::<i64>().ok().map(|ts| (false, ts));
+    }
+
+    None
 }

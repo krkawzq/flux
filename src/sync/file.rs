@@ -7,6 +7,7 @@ use crate::output::{self, Status};
 use crate::path::FluxPath;
 use crate::ssh::SshClient;
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -98,11 +99,23 @@ async fn sync_file_inner(client: &SshClient, file: &FileItem) -> Result<(Status,
             // Check timestamps
             if let Some(remote_mtime) = client.get_mtime(&remote_path).await? {
                 let local_mtime = get_local_mtime(&local_path)?;
-                if remote_mtime >= local_mtime {
+                if remote_mtime > local_mtime {
                     return Ok((
                         Status::Skip,
                         Some("remote is newer, mode: sync".to_string()),
                     ));
+                }
+
+                if remote_mtime == local_mtime {
+                    let local_hash = compute_hash(&std::fs::read(&local_path)?);
+                    let remote_hash = compute_hash(&client.read_remote_file(&remote_path).await?);
+
+                    if local_hash == remote_hash {
+                        return Ok((
+                            Status::Skip,
+                            Some("content unchanged, mode: sync".to_string()),
+                        ));
+                    }
                 }
             }
         }
@@ -128,4 +141,11 @@ fn get_local_mtime(path: &Path) -> Result<i64> {
     let mtime = metadata.modified()?;
     let duration = mtime.duration_since(std::time::UNIX_EPOCH)?;
     Ok(duration.as_secs() as i64)
+}
+
+fn compute_hash(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
 }

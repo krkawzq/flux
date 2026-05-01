@@ -6,10 +6,13 @@ mod config;
 mod output;
 mod path;
 mod remote;
+mod reporter;
 mod sync;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use reporter::console::ConsoleReporter;
+use reporter::Reporter;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -87,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Initialize .flux directory structure
 fn run_init() -> anyhow::Result<()> {
+    let reporter = ConsoleReporter::new();
     let flux_dir = PathBuf::from(".flux");
 
     let dirs = ["scripts", "blocks", "files"];
@@ -95,7 +99,7 @@ fn run_init() -> anyhow::Result<()> {
         let path = flux_dir.join(dir);
         if !path.exists() {
             std::fs::create_dir_all(&path)?;
-            output::print_info(&format!("Created {}", path.display()));
+            reporter.info(&format!("Created {}", path.display()));
         }
     }
 
@@ -106,10 +110,11 @@ fn run_init() -> anyhow::Result<()> {
 
 /// Run sync command
 async fn run_sync(config_name: &str, save_name: Option<String>) -> anyhow::Result<()> {
+    let reporter = ConsoleReporter::new();
     // Find and load config
     let (config, config_path) = config::Config::find_and_load(config_name)?;
 
-    output::print_info(&format!("Using config: {}", config_path.display()));
+    reporter.info(&format!("Using config: {}", config_path.display()));
 
     // Run sync pipeline
     let ssh_config = sync::run_sync(config, &config_path).await?;
@@ -232,13 +237,14 @@ async fn run_proxy(
     key_override: Option<String>,
     retry_interval: u64,
 ) -> anyhow::Result<()> {
+    let reporter = ConsoleReporter::new();
     use dialoguer::Password;
     use std::net::TcpStream as StdTcpStream;
 
     // Check if local port is listening
     let local_available = StdTcpStream::connect(format!("127.0.0.1:{}", local_port)).is_ok();
     if !local_available {
-        output::print_warning(&format!(
+        reporter.warning(&format!(
             "Local port {} is not listening (no proxy service?)",
             local_port
         ));
@@ -255,13 +261,13 @@ async fn run_proxy(
 
     output::print_header("SSH Reverse Proxy Tunnel");
     println!();
-    output::print_info(&format!("Remote: {}@{}:{}", user, hostname, port));
-    output::print_info(&format!(
+    reporter.info(&format!("Remote: {}@{}:{}", user, hostname, port));
+    reporter.info(&format!(
         "Tunnel: remote:{} ← local:{}",
         remote_port, local_port
     ));
     if let Some(ref k) = key_path {
-        output::print_info(&format!("Key: {}", k));
+        reporter.info(&format!("Key: {}", k));
     }
     println!();
 
@@ -272,9 +278,9 @@ async fn run_proxy(
         retry_count += 1;
 
         if retry_count > 1 {
-            output::print_info(&format!("Reconnecting (attempt {})...", retry_count));
+            reporter.info(&format!("Reconnecting (attempt {})...", retry_count));
         } else {
-            output::print_info("Connecting...");
+            reporter.info("Connecting...");
         }
 
         // Only ask for password if no key available and not cached
@@ -313,14 +319,14 @@ async fn run_proxy(
                                 remote_port, local_port
                             ),
                         );
-                        output::print_info("Press Ctrl+C to stop");
+                        reporter.info("Press Ctrl+C to stop");
 
                         // Keep connection alive - wait for disconnect or interrupt
                         loop {
                             tokio::select! {
                                 _ = tokio::signal::ctrl_c() => {
                                     println!();
-                                    output::print_info("Interrupted, closing...");
+                                    reporter.info("Interrupted, closing...");
                                     client.close().await.ok();
                                     return Ok(());
                                 }
@@ -343,16 +349,16 @@ async fn run_proxy(
 
         // Retry logic
         if retry_interval == 0 {
-            output::print_info("Retry disabled, exiting");
+            reporter.info("Retry disabled, exiting");
             return Ok(());
         }
 
-        output::print_info(&format!("Retrying in {} seconds...", retry_interval));
+        reporter.info(&format!("Retrying in {} seconds...", retry_interval));
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!();
-                output::print_info("Interrupted, exiting");
+                reporter.info("Interrupted, exiting");
                 return Ok(());
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(retry_interval)) => {}

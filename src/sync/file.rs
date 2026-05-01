@@ -1,157 +1,429 @@
-//! File synchronization module
-//!
-//! Handles file sync between local and remote.
+//! File sync stage.
 
 use crate::config::{FileItem, SyncMode};
 use crate::output::{self, Status};
 use crate::path::FluxPath;
+use crate::remote::{RemoteOps, RemoteOpsError};
 use crate::remote::ssh::SshClient;
-use anyhow::Result;
+use crate::reporter::{ItemOutcome, Reporter, Stage};
+use crate::sync::plan::{FileAction, SkipReason};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileError {
-    #[error("file sync placeholder")]
-    Placeholder,
+    #[error("source not found: {0}")]
+    SourceNotFound(String),
+    #[error("source is a directory, not a file: {0}")]
+    SourceIsDirectory(String),
+    #[error("local io: {0}")]
+    LocalIo(String),
+    #[error("invalid path: {0}")]
+    InvalidPath(String),
+    #[error("only local->remote sync is supported (got src={src} dst={dst})")]
+    UnsupportedDirection { src: String, dst: String },
 }
 
-/// Result of a file sync operation
+/// Compute file actions without touching the remote write surface.
+pub async fn plan_files<R: RemoteOps + ?Sized>(items: &[FileItem], remote: &R) -> Vec<FileAction> {
+    let mut actions = Vec::with_capacity(items.len());
+    for item in items {
+        actions.push(plan_one_file(item, remote).await);
+    }
+    actions
+}
+
+async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> FileAction {
+    let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
+    let src = FluxPath::parse(&item.src);
+    let dst = FluxPath::parse(&item.dst);
+
+    let local_path = match src {
+        FluxPath::Local(path) => path,
+        FluxPath::Remote(_) => {
+            return FileAction::Failed {
+                item_name,
+                error: FileError::UnsupportedDirection {
+                    src: item.src.clone(),
+                    dst: item.dst.clone(),
+                }
+                .into(),
+            };
+        }
+    };
+    let remote_path = match dst {
+        FluxPath::Remote(path) => path,
+        FluxPath::Local(_) => {
+            return FileAction::Failed {
+                item_name,
+                error: FileError::UnsupportedDirection {
+                    src: item.src.clone(),
+                    dst: item.dst.clone(),
+                }
+                .into(),
+            };
+        }
+    };
+
+    let metadata = match std::fs::metadata(&local_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return FileAction::Failed {
+                item_name,
+                error: FileError::SourceNotFound(local_path.display().to_string()).into(),
+            };
+        }
+        Err(err) => {
+            return FileAction::Failed {
+                item_name,
+                error: FileError::LocalIo(err.to_string()).into(),
+            };
+        }
+    };
+    if metadata.is_dir() {
+        return FileAction::Failed {
+            item_name,
+            error: FileError::SourceIsDirectory(local_path.display().to_string()).into(),
+        };
+    }
+    let bytes = match std::fs::read(&local_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return FileAction::Failed {
+                item_name,
+                error: FileError::LocalIo(err.to_string()).into(),
+            };
+        }
+    };
+
+    let chmod = item
+        .chmod
+        .as_deref()
+        .and_then(|value| u32::from_str_radix(value, 8).ok());
+    let exists_remote = match remote.exists(&remote_path).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            return FileAction::Failed {
+                item_name,
+                error: err.into(),
+            };
+        }
+    };
+
+    match item.mode {
+        SyncMode::Touch if exists_remote => FileAction::Skip {
+            item_name,
+            reason: SkipReason::AlreadyExists,
+        },
+        SyncMode::Sync if exists_remote => {
+            let local_mtime = match local_mtime(&local_path) {
+                Ok(mtime) => mtime,
+                Err(err) => {
+                    return FileAction::Failed {
+                        item_name,
+                        error: err.into(),
+                    };
+                }
+            };
+            match remote.mtime(&remote_path).await {
+                Ok(remote_mtime) if remote_mtime > local_mtime => FileAction::Skip {
+                    item_name,
+                    reason: SkipReason::RemoteNewer,
+                },
+                Ok(remote_mtime) if remote_mtime == local_mtime => {
+                    match remote.read_file(&remote_path).await {
+                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&bytes) => FileAction::Skip {
+                            item_name,
+                            reason: SkipReason::ContentUnchanged,
+                        },
+                        Ok(_) => FileAction::Apply {
+                            item_name,
+                            dst: remote_path,
+                            bytes,
+                            chmod,
+                        },
+                        Err(err) => FileAction::Failed {
+                            item_name,
+                            error: err.into(),
+                        },
+                    }
+                }
+                Ok(_) => FileAction::Apply {
+                    item_name,
+                    dst: remote_path,
+                    bytes,
+                    chmod,
+                },
+                Err(err) => FileAction::Failed {
+                    item_name,
+                    error: err.into(),
+                },
+            }
+        }
+        _ => FileAction::Apply {
+            item_name,
+            dst: remote_path,
+            bytes,
+            chmod,
+        },
+    }
+}
+
+fn local_mtime(path: &Path) -> Result<chrono::DateTime<chrono::Utc>, RemoteOpsError> {
+    let metadata = std::fs::metadata(path).map_err(|err| RemoteOpsError::Io(err.to_string()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|err| RemoteOpsError::Io(err.to_string()))?;
+    Ok(chrono::DateTime::<chrono::Utc>::from(modified))
+}
+
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+pub async fn execute_file<R: RemoteOps + ?Sized>(
+    action: &FileAction,
+    remote: &R,
+    reporter: &dyn Reporter,
+) -> ItemOutcome {
+    let name = action_name(action);
+    reporter.item_started(Stage::File, &name);
+    let outcome = match action {
+        FileAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
+        FileAction::Failed { error, .. } => ItemOutcome::Failed(error.to_string()),
+        FileAction::Apply {
+            dst, bytes, chmod, ..
+        } => {
+            if let Some(parent) = parent_dir(dst) {
+                if let Err(err) = remote.ensure_dir(parent).await {
+                    return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                }
+            }
+            if let Err(err) = remote.write_file(dst, bytes).await {
+                return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+            }
+            if let Some(mode) = chmod {
+                if let Err(err) = remote.chmod(dst, *mode).await {
+                    return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                }
+            }
+            ItemOutcome::Applied
+        }
+    };
+    reporter.item_finished(Stage::File, &name, &outcome);
+    outcome
+}
+
+fn finish(reporter: &dyn Reporter, name: &str, outcome: ItemOutcome) -> ItemOutcome {
+    reporter.item_finished(Stage::File, name, &outcome);
+    outcome
+}
+
+fn action_name(action: &FileAction) -> String {
+    match action {
+        FileAction::Skip { item_name, .. }
+        | FileAction::Apply { item_name, .. }
+        | FileAction::Failed { item_name, .. } => item_name.clone(),
+    }
+}
+
+fn parent_dir(path: &str) -> Option<&str> {
+    path.rfind('/').and_then(|idx| {
+        if idx == 0 {
+            Some("/")
+        } else if idx > 0 {
+            Some(&path[..idx])
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Debug)]
 pub struct FileSyncResult {
-    #[allow(dead_code)]
     pub name: Option<String>,
     pub status: Status,
     pub reason: Option<String>,
 }
 
-/// Sync all files
+/// Transitional wrapper until `sync::mod` is rewritten to Pipeline.
 pub async fn sync_files(
     client: &SshClient,
     files: &[FileItem],
-) -> Result<(Vec<FileSyncResult>, HashMap<String, bool>)> {
-    let mut results = Vec::new();
-    let mut file_status: HashMap<String, bool> = HashMap::new();
+) -> anyhow::Result<(Vec<FileSyncResult>, HashMap<String, bool>)> {
+    let actions = plan_files(files, client).await;
+    let reporter = crate::reporter::memory::CapturedReporter::new();
+    let mut results = Vec::with_capacity(actions.len());
+    let mut file_status = HashMap::new();
 
-    for file in files {
-        let result = sync_file(client, file).await;
+    for action in &actions {
+        let outcome = execute_file(action, client, &reporter).await;
+        let name = match action {
+            FileAction::Skip { item_name, .. }
+            | FileAction::Apply { item_name, .. }
+            | FileAction::Failed { item_name, .. } => Some(item_name.clone()),
+        };
+        let status = match &outcome {
+            ItemOutcome::Applied => Status::Success,
+            ItemOutcome::Skipped(_) => Status::Skip,
+            ItemOutcome::Failed(_) => Status::Failed,
+        };
+        let reason = match &outcome {
+            ItemOutcome::Applied => None,
+            ItemOutcome::Skipped(reason) => Some(skip_reason_text(reason)),
+            ItemOutcome::Failed(error) => Some(error.clone()),
+        };
 
-        // Track named files for dependency checking
-        if let Some(name) = &file.name {
-            file_status.insert(name.clone(), result.status == Status::Success);
+        if let Some(action_name) = &name {
+            file_status.insert(action_name.clone(), matches!(outcome, ItemOutcome::Applied));
         }
 
-        // Print output
-        let src_path = FluxPath::parse(&file.src);
-        let dst_path = FluxPath::parse(&file.dst);
-        output::print_file(&src_path.as_str(), &dst_path.to_string());
-        output::print_file_result(result.status, result.reason.as_deref());
+        let src_path = FluxPath::parse(match action {
+            FileAction::Skip { item_name, .. }
+            | FileAction::Apply { item_name, .. }
+            | FileAction::Failed { item_name, .. } => files
+                .iter()
+                .find(|file| file.name.as_deref().unwrap_or(&file.src) == item_name)
+                .map(|file| file.src.as_str())
+                .unwrap_or(item_name),
+        });
+        let dst_display = match action {
+            FileAction::Apply { dst, .. } => format!(":{dst}"),
+            _ => files
+                .iter()
+                .find(|file| file.name.as_deref().unwrap_or(&file.src) == name.as_deref().unwrap_or(""))
+                .map(|file| file.dst.clone())
+                .unwrap_or_default(),
+        };
+        output::print_file(&src_path.as_str(), &dst_display);
+        output::print_file_result(status, reason.as_deref());
 
-        results.push(result);
+        results.push(FileSyncResult {
+            name,
+            status,
+            reason,
+        });
     }
 
     Ok((results, file_status))
 }
 
-/// Sync a single file
-async fn sync_file(client: &SshClient, file: &FileItem) -> FileSyncResult {
-    let name = file.name.clone();
-
-    match sync_file_inner(client, file).await {
-        Ok((status, reason)) => FileSyncResult {
-            name,
-            status,
-            reason,
-        },
-        Err(e) => FileSyncResult {
-            name,
-            status: Status::Failed,
-            reason: Some(e.to_string()),
-        },
+fn skip_reason_text(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::AlreadyExists => "already exists".to_string(),
+        SkipReason::RemoteNewer => "remote newer".to_string(),
+        SkipReason::ContentUnchanged => "content unchanged".to_string(),
+        SkipReason::DependencyFailed(dep) => format!("dependency failed: {dep}"),
     }
 }
 
-async fn sync_file_inner(client: &SshClient, file: &FileItem) -> Result<(Status, Option<String>)> {
-    let src = FluxPath::parse(&file.src);
-    let dst = FluxPath::parse(&file.dst);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::fake::InMemoryRemote;
+    use crate::reporter::memory::CapturedReporter;
+    use tempfile::TempDir;
 
-    // Currently only support local -> remote
-    if src.is_remote() {
-        anyhow::bail!("Remote source not yet supported");
-    }
-    if dst.is_local() {
-        anyhow::bail!("Local destination not yet supported");
-    }
-
-    let local_path = src.resolve_local()?;
-    let remote_path = dst.resolve_remote()?;
-    let remote_path = client.expand_remote_path(&remote_path).await?;
-
-    // Check if local file exists
-    if !local_path.exists() {
-        return Ok((Status::Failed, Some("source file not found".to_string())));
+    fn local_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
     }
 
-    // Handle different sync modes
-    match file.mode {
-        SyncMode::Touch => {
-            // Only sync if remote doesn't exist
-            if client.file_exists(&remote_path).await? {
-                return Ok((Status::Skip, Some("file exists, mode: touch".to_string())));
+    fn item(name: &str, src: &str, dst: &str, mode: SyncMode) -> FileItem {
+        FileItem {
+            name: Some(name.into()),
+            src: src.into(),
+            dst: dst.into(),
+            mode,
+            chmod: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn touch_skips_when_remote_exists() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"x");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Touch)], &remote).await;
+        assert!(matches!(
+            &actions[0],
+            FileAction::Skip {
+                reason: SkipReason::AlreadyExists,
+                ..
             }
-        }
-        SyncMode::Sync => {
-            // Check timestamps
-            if let Some(remote_mtime) = client.get_mtime(&remote_path).await? {
-                let local_mtime = get_local_mtime(&local_path)?;
-                if remote_mtime > local_mtime {
-                    return Ok((
-                        Status::Skip,
-                        Some("remote is newer, mode: sync".to_string()),
-                    ));
-                }
+        ));
+    }
 
-                if remote_mtime == local_mtime {
-                    let local_hash = compute_hash(&std::fs::read(&local_path)?);
-                    let remote_hash = compute_hash(&client.read_remote_file(&remote_path).await?);
+    #[tokio::test]
+    async fn cover_always_applies() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"new");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Cover)], &remote).await;
+        assert!(matches!(&actions[0], FileAction::Apply { .. }));
+    }
 
-                    if local_hash == remote_hash {
-                        return Ok((
-                            Status::Skip,
-                            Some("content unchanged, mode: sync".to_string()),
-                        ));
-                    }
-                }
+    #[tokio::test]
+    async fn sync_skip_when_remote_newer() {
+        use chrono::{Duration, Utc};
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"x");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        remote.set_mtime("/r/a.txt", Utc::now() + Duration::seconds(60));
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Sync)], &remote).await;
+        assert!(matches!(
+            &actions[0],
+            FileAction::Skip {
+                reason: SkipReason::RemoteNewer,
+                ..
             }
-        }
-        SyncMode::Cover => {
-            // Always overwrite, no checks needed
-        }
+        ));
     }
 
-    // Upload the file
-    client.upload_file(&local_path, &remote_path).await?;
-
-    // Set permissions if specified
-    if let Some(chmod) = &file.chmod {
-        client.chmod(&remote_path, chmod).await?;
+    #[tokio::test]
+    async fn sync_skip_when_content_identical_with_equal_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"same");
+        let local_modified = std::fs::metadata(&src).unwrap().modified().unwrap();
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"same".to_vec())]);
+        remote.set_mtime("/r/a.txt", chrono::DateTime::<chrono::Utc>::from(local_modified));
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Sync)], &remote).await;
+        assert!(matches!(
+            &actions[0],
+            FileAction::Skip {
+                reason: SkipReason::ContentUnchanged,
+                ..
+            }
+        ));
     }
 
-    Ok((Status::Success, None))
-}
+    #[tokio::test]
+    async fn missing_source_returns_failed() {
+        let remote = InMemoryRemote::new();
+        let actions = plan_files(
+            &[item("a", "/no/such/file", ":/r/a.txt", SyncMode::Cover)],
+            &remote,
+        )
+        .await;
+        assert!(matches!(&actions[0], FileAction::Failed { .. }));
+    }
 
-/// Get local file modification time as unix timestamp
-fn get_local_mtime(path: &Path) -> Result<i64> {
-    let metadata = std::fs::metadata(path)?;
-    let mtime = metadata.modified()?;
-    let duration = mtime.duration_since(std::time::UNIX_EPOCH)?;
-    Ok(duration.as_secs() as i64)
-}
-
-fn compute_hash(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect()
+    #[tokio::test]
+    async fn execute_apply_writes_bytes_and_chmod() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let remote = InMemoryRemote::new();
+        let mut file = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        file.chmod = Some("600".into());
+        let actions = plan_files(&[file], &remote).await;
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter).await;
+        assert!(matches!(outcome, ItemOutcome::Applied));
+        assert_eq!(remote.file_contents("/r/a.txt"), Some(b"hello".to_vec()));
+        assert_eq!(remote.file_mode("/r/a.txt"), Some(0o600));
+    }
 }

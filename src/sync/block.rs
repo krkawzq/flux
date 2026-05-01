@@ -1,297 +1,508 @@
-//! Block synchronization module
-//!
-//! Handles block injection into remote config files using sentinel comments.
+//! Block injection stage.
 
 use crate::config::{BlockItem, SyncMode};
 use crate::output::{self, Status};
 use crate::path::FluxPath;
+use crate::remote::RemoteOps;
 use crate::remote::ssh::SshClient;
-use anyhow::Result;
+use crate::reporter::{ItemOutcome, Reporter, Stage};
+use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BlockError {
-    #[error("bad comment template")]
+    #[error("comment template missing {{}} placeholder")]
     BadTemplate,
+    #[error("malformed sentinel for block '{name}'")]
+    MalformedSentinel { name: String },
+    #[error("local block source not found: {0}")]
+    SourceNotFound(String),
+    #[error("local io: {0}")]
+    LocalIo(String),
 }
 
-/// Result of a block sync operation
+pub fn build_markers(
+    template: &str,
+    name: &str,
+    timestamp: i64,
+) -> Result<(String, String), BlockError> {
+    if !template.contains("{}") {
+        return Err(BlockError::BadTemplate);
+    }
+    let open = template.replace("{}", &format!(">>> {name}:{timestamp} >>>"));
+    let close = template.replace("{}", &format!("<<< {name}:{timestamp} <<<"));
+    Ok((open, close))
+}
+
+pub fn find_block(
+    template: &str,
+    name: &str,
+    content: &str,
+) -> Result<Option<FoundBlock>, BlockError> {
+    if !template.contains("{}") {
+        return Err(BlockError::BadTemplate);
+    }
+    let prefix_open = template
+        .replace("{}", &format!(">>> {name}:"))
+        .trim_end()
+        .to_string();
+    let prefix_close = template
+        .replace("{}", &format!("<<< {name}:"))
+        .trim_end()
+        .to_string();
+    let suffix_open = " >>>";
+    let suffix_close = " <<<";
+
+    let mut byte = 0usize;
+    let mut open = None;
+    let mut close = None;
+    for piece in split_keep_terminators(content) {
+        let line = piece.trim_end_matches(['\n', '\r']);
+        if open.is_none() {
+            if line.starts_with(&prefix_open) && line.ends_with(suffix_open) {
+                let mid = &line[prefix_open.len()..line.len() - suffix_open.len()];
+                if let Ok(timestamp) = mid.parse::<i64>() {
+                    open = Some((byte, byte + piece.len(), timestamp));
+                }
+            }
+        } else if close.is_none()
+            && line.starts_with(&prefix_close)
+            && line.ends_with(suffix_close)
+        {
+            let mid = &line[prefix_close.len()..line.len() - suffix_close.len()];
+            if mid.parse::<i64>().is_ok() {
+                close = Some((byte, byte + piece.len()));
+                break;
+            }
+        }
+        byte += piece.len();
+    }
+
+    match (open, close) {
+        (Some((open_start, _, timestamp)), Some((_, close_end))) => Ok(Some(FoundBlock {
+            byte_range: open_start..close_end,
+            timestamp,
+        })),
+        (Some(_), None) => Err(BlockError::MalformedSentinel { name: name.into() }),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundBlock {
+    pub byte_range: std::ops::Range<usize>,
+    pub timestamp: i64,
+}
+
+fn split_keep_terminators(input: &str) -> Vec<&str> {
+    input.split_inclusive('\n').collect()
+}
+
+pub async fn plan_blocks<R: RemoteOps + ?Sized>(
+    items: &[BlockItem],
+    asset_root: &Path,
+    template: &str,
+    remote: &R,
+) -> Vec<BlockAction> {
+    let mut actions = Vec::with_capacity(items.len());
+    for item in items {
+        actions.push(plan_one_block(item, asset_root, template, remote).await);
+    }
+    actions
+}
+
+async fn plan_one_block<R: RemoteOps + ?Sized>(
+    item: &BlockItem,
+    asset_root: &Path,
+    template: &str,
+    remote: &R,
+) -> BlockAction {
+    let item_name = item.name.clone();
+    let local_path = resolve_block_path(asset_root, &item.path);
+    let local_body = match std::fs::read_to_string(&local_path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return BlockAction::Failed {
+                item_name,
+                error: BlockError::SourceNotFound(local_path.display().to_string()).into(),
+            };
+        }
+        Err(err) => {
+            return BlockAction::Failed {
+                item_name,
+                error: BlockError::LocalIo(err.to_string()).into(),
+            };
+        }
+    };
+
+    let target = match FluxPath::parse(&item.file) {
+        FluxPath::Remote(path) => path,
+        FluxPath::Local(_) => {
+            return BlockAction::Failed {
+                item_name,
+                error: BlockError::LocalIo(format!("block target must be remote: {}", item.file))
+                    .into(),
+            };
+        }
+    };
+
+    let exists_remote = match remote.exists(&target).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            return BlockAction::Failed {
+                item_name,
+                error: err.into(),
+            };
+        }
+    };
+    let timestamp = Utc::now().timestamp();
+    let chosen_template = item.comment_template.as_deref().unwrap_or(template);
+    let (open_marker, close_marker) = match build_markers(chosen_template, &item_name, timestamp) {
+        Ok(markers) => markers,
+        Err(err) => {
+            return BlockAction::Failed {
+                item_name,
+                error: err.into(),
+            };
+        }
+    };
+    let sentinel = Sentinel {
+        name: item_name.clone(),
+        timestamp,
+        open_marker,
+        close_marker,
+    };
+
+    if !exists_remote {
+        return BlockAction::Apply {
+            item_name,
+            target,
+            body: local_body,
+            sentinel,
+        };
+    }
+
+    let remote_content = match remote.read_file(&target).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) => {
+            return BlockAction::Failed {
+                item_name,
+                error: err.into(),
+            };
+        }
+    };
+    let found = match find_block(chosen_template, &item_name, &remote_content) {
+        Ok(found) => found,
+        Err(err) => {
+            return BlockAction::Failed {
+                item_name,
+                error: err.into(),
+            };
+        }
+    };
+
+    match (item.mode.clone(), found) {
+        (SyncMode::Touch, Some(_)) => BlockAction::Skip {
+            item_name,
+            reason: SkipReason::AlreadyExists,
+        },
+        (SyncMode::Sync, Some(found_block)) => {
+            let existing_body = extract_body(&remote_content, &found_block);
+            if hash(existing_body.as_bytes()) == hash(local_body.as_bytes()) {
+                BlockAction::Skip {
+                    item_name,
+                    reason: SkipReason::ContentUnchanged,
+                }
+            } else {
+                let local_mtime = std::fs::metadata(&local_path).and_then(|m| m.modified()).ok();
+                let remote_mtime = remote.mtime(&target).await.ok();
+                if let (Some(remote_time), Some(local_time)) = (remote_mtime, local_mtime) {
+                    let local_time: DateTime<Utc> = local_time.into();
+                    if remote_time > local_time {
+                        return BlockAction::Skip {
+                            item_name,
+                            reason: SkipReason::RemoteNewer,
+                        };
+                    }
+                }
+                BlockAction::Apply {
+                    item_name,
+                    target,
+                    body: local_body,
+                    sentinel,
+                }
+            }
+        }
+        _ => BlockAction::Apply {
+            item_name,
+            target,
+            body: local_body,
+            sentinel,
+        },
+    }
+}
+
+fn extract_body(content: &str, found: &FoundBlock) -> String {
+    let block = &content[found.byte_range.clone()];
+    let mut lines: Vec<&str> = block.split_inclusive('\n').collect();
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    if !lines.is_empty() {
+        lines.pop();
+    }
+    lines.concat()
+}
+
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+pub async fn execute_block<R: RemoteOps + ?Sized>(
+    action: &BlockAction,
+    remote: &R,
+    template: &str,
+    reporter: &dyn Reporter,
+) -> ItemOutcome {
+    let name = action_name(action);
+    reporter.item_started(Stage::Block, &name);
+    let outcome = match action {
+        BlockAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
+        BlockAction::Failed { error, .. } => ItemOutcome::Failed(error.to_string()),
+        BlockAction::Apply {
+            target,
+            body,
+            sentinel,
+            ..
+        } => {
+            let current = match remote.exists(target).await {
+                Ok(true) => match remote.read_file(target).await {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(err) => {
+                        return finish_block(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                    }
+                },
+                Ok(false) => String::new(),
+                Err(err) => {
+                    return finish_block(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                }
+            };
+            match compose(&current, body, sentinel, template, &name) {
+                Ok(content) => match remote.write_file(target, content.as_bytes()).await {
+                    Ok(()) => ItemOutcome::Applied,
+                    Err(err) => ItemOutcome::Failed(err.to_string()),
+                },
+                Err(err) => ItemOutcome::Failed(err.to_string()),
+            }
+        }
+    };
+    reporter.item_finished(Stage::Block, &name, &outcome);
+    outcome
+}
+
+fn finish_block(reporter: &dyn Reporter, name: &str, outcome: ItemOutcome) -> ItemOutcome {
+    reporter.item_finished(Stage::Block, name, &outcome);
+    outcome
+}
+
+fn compose(
+    existing: &str,
+    body: &str,
+    sentinel: &Sentinel,
+    template: &str,
+    name: &str,
+) -> Result<String, BlockError> {
+    let injected = format!(
+        "{}\n{}{}{}\n",
+        sentinel.open_marker,
+        body,
+        if body.ends_with('\n') { "" } else { "\n" },
+        sentinel.close_marker,
+    );
+    match find_block(template, name, existing)? {
+        Some(found) => {
+            let mut out = String::with_capacity(existing.len() + injected.len());
+            out.push_str(&existing[..found.byte_range.start]);
+            out.push_str(&injected);
+            out.push_str(&existing[found.byte_range.end..]);
+            Ok(out)
+        }
+        None => {
+            let mut out = String::from(existing);
+            if !out.ends_with('\n') && !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&injected);
+            Ok(out)
+        }
+    }
+}
+
+fn resolve_block_path(asset_root: &Path, path: &str) -> PathBuf {
+    if let Some(remote) = path.strip_prefix(':') {
+        asset_root.join(remote)
+    } else {
+        asset_root.join(path)
+    }
+}
+
+fn action_name(action: &BlockAction) -> String {
+    match action {
+        BlockAction::Skip { item_name, .. }
+        | BlockAction::Apply { item_name, .. }
+        | BlockAction::Failed { item_name, .. } => item_name.clone(),
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockResult {
     pub status: Status,
     pub reason: Option<String>,
 }
 
-/// Sync all blocks
+/// Transitional wrapper until `sync::mod` is rewritten to Pipeline.
 pub async fn sync_blocks(
     client: &SshClient,
     blocks: &[BlockItem],
     default_comment_template: &str,
-) -> Result<Vec<BlockResult>> {
-    let mut results = Vec::new();
+) -> anyhow::Result<Vec<BlockResult>> {
+    let reporter = crate::reporter::memory::CapturedReporter::new();
+    let actions = plan_blocks(blocks, Path::new(""), default_comment_template, client).await;
+    let mut results = Vec::with_capacity(actions.len());
 
-    for block in blocks {
-        let result = sync_block(client, block, default_comment_template).await;
+    for action in &actions {
+        let name = action_name(action);
+        let outcome = execute_block(action, client, default_comment_template, &reporter).await;
+        let status = match &outcome {
+            ItemOutcome::Applied => Status::Success,
+            ItemOutcome::Skipped(_) => Status::Skip,
+            ItemOutcome::Failed(_) => Status::Failed,
+        };
+        let reason = match &outcome {
+            ItemOutcome::Applied => None,
+            ItemOutcome::Skipped(reason) => Some(skip_reason_text(reason)),
+            ItemOutcome::Failed(error) => Some(error.clone()),
+        };
 
-        output::print_block(&block.name, &block.file);
-        output::print_block_result(result.status, result.reason.as_deref());
+        let target = match action {
+            BlockAction::Apply { target, .. } => format!(":{target}"),
+            _ => blocks
+                .iter()
+                .find(|block| block.name == name)
+                .map(|block| block.file.clone())
+                .unwrap_or_default(),
+        };
+        output::print_block(&name, &target);
+        output::print_block_result(status, reason.as_deref());
 
-        results.push(result);
+        results.push(BlockResult { status, reason });
     }
 
     Ok(results)
 }
 
-/// Sync a single block
-async fn sync_block(
-    client: &SshClient,
-    block: &BlockItem,
-    default_comment_template: &str,
-) -> BlockResult {
-    match sync_block_inner(client, block, default_comment_template).await {
-        Ok((status, reason)) => BlockResult { status, reason },
-        Err(e) => BlockResult {
-            status: Status::Failed,
-            reason: Some(e.to_string()),
-        },
+fn skip_reason_text(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::AlreadyExists => "already exists".into(),
+        SkipReason::RemoteNewer => "remote newer".into(),
+        SkipReason::ContentUnchanged => "content unchanged".into(),
+        SkipReason::DependencyFailed(dep) => format!("dep {dep} failed"),
     }
 }
 
-async fn sync_block_inner(
-    client: &SshClient,
-    block: &BlockItem,
-    default_comment_template: &str,
-) -> Result<(Status, Option<String>)> {
-    // Parse paths
-    let src = FluxPath::parse(&block.path);
-    let dst = FluxPath::parse(&block.file);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if src.is_remote() {
-        anyhow::bail!("Block source must be local");
-    }
-    if dst.is_local() {
-        anyhow::bail!("Block target must be remote");
+    #[test]
+    fn build_markers_basic() {
+        let (open, close) = build_markers("# {}", "aliases", 1_700_000_000).unwrap();
+        assert_eq!(open, "# >>> aliases:1700000000 >>>");
+        assert_eq!(close, "# <<< aliases:1700000000 <<<");
     }
 
-    // Read local block content
-    let local_path = src.resolve_local()?;
-    if !local_path.exists() {
-        return Ok((Status::Failed, Some("block file not found".to_string())));
-    }
-    let block_content = std::fs::read_to_string(&local_path)?;
-    let local_mtime = get_local_mtime(&local_path)?;
-
-    // Get remote file path
-    let remote_path = dst.resolve_remote()?;
-    let remote_path = client.expand_remote_path(&remote_path).await?;
-
-    // Check if remote file exists
-    if !client.file_exists(&remote_path).await? {
-        return Ok((Status::Skip, Some("target file not found".to_string())));
+    #[test]
+    fn build_markers_bad_template() {
+        let err = build_markers("no placeholder", "x", 1).unwrap_err();
+        assert!(matches!(err, BlockError::BadTemplate));
     }
 
-    // Read remote file content
-    let remote_content =
-        String::from_utf8_lossy(&client.read_remote_file(&remote_path).await?).to_string();
-
-    // Get comment template
-    let comment_template = block
-        .comment_template
-        .as_deref()
-        .unwrap_or(default_comment_template);
-
-    // Generate sentinels
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let (start_sentinel, end_sentinel) =
-        generate_sentinels(comment_template, &block.name, timestamp);
-
-    // Find existing block
-    let existing_block = find_existing_block(&remote_content, comment_template, &block.name);
-
-    match (&existing_block, &block.mode) {
-        // Block exists and mode is touch -> skip
-        (Some(_), SyncMode::Touch) => {
-            return Ok((Status::Skip, Some("block exists, mode: touch".to_string())));
-        }
-        // Block exists and mode is sync -> check timestamp
-        (Some((_, _, existing_content)), SyncMode::Sync) => {
-            // Compare hash to see if content changed
-            let existing_hash = compute_hash(existing_content.trim().as_bytes());
-            let new_hash = compute_hash(block_content.trim().as_bytes());
-
-            if existing_hash == new_hash {
-                return Ok((Status::Skip, Some("content unchanged".to_string())));
-            }
-
-            if let Some(remote_mtime) = client.get_mtime(&remote_path).await? {
-                if remote_mtime >= local_mtime {
-                    return Ok((
-                        Status::Skip,
-                        Some("remote is newer, mode: sync".to_string()),
-                    ));
-                }
-            }
-        }
-        _ => {}
+    #[test]
+    fn find_block_missing_returns_none() {
+        let found = find_block("# {}", "aliases", "echo hi\n").unwrap();
+        assert!(found.is_none());
     }
 
-    // Build new file content
-    let new_content = if let Some((range, _, _)) = existing_block {
-        // Replace existing block
-        let mut content = remote_content.clone();
-        let block_text = format!(
-            "{}\n{}\n{}",
-            start_sentinel,
-            block_content.trim(),
-            end_sentinel
+    #[test]
+    fn find_block_round_trip() {
+        let content = "before\n# >>> aliases:42 >>>\nalias x='1'\n# <<< aliases:42 <<<\nafter\n";
+        let found = find_block("# {}", "aliases", content).unwrap().unwrap();
+        assert_eq!(found.timestamp, 42);
+        assert_eq!(
+            &content[found.byte_range],
+            "# >>> aliases:42 >>>\nalias x='1'\n# <<< aliases:42 <<<\n"
         );
-        content.replace_range(range, &block_text);
-        content
-    } else {
-        // Append new block
-        let block_text = format!(
-            "\n{}\n{}\n{}\n",
-            start_sentinel,
-            block_content.trim(),
-            end_sentinel
-        );
-        format!("{}{}", remote_content.trim_end(), block_text)
-    };
-
-    // Write back to remote
-    client
-        .write_remote_file(&remote_path, new_content.as_bytes())
-        .await?;
-
-    Ok((Status::Success, None))
-}
-
-/// Generate start and end sentinels
-fn generate_sentinels(template: &str, name: &str, timestamp: u64) -> (String, String) {
-    let marker = format!("{}:{}", name, timestamp);
-    let start = template.replace("{}", &format!(">>> {} >>>", marker));
-    let end = template.replace("{}", &format!("<<< {} <<<", marker));
-    (start, end)
-}
-
-/// Find existing block in content
-/// Returns (range, timestamp, content) if found
-fn find_existing_block(
-    content: &str,
-    template: &str,
-    name: &str,
-) -> Option<(std::ops::Range<usize>, Option<i64>, String)> {
-    let line_infos = collect_lines_with_offsets(content);
-    let mut start_line = None;
-    let mut start_timestamp = None;
-    let mut end_line = None;
-
-    for (i, line_info) in line_infos.iter().enumerate() {
-        if let Some((true, ts)) = parse_sentinel_line(line_info.content, template, name) {
-            start_line = Some(i);
-            start_timestamp = Some(ts);
-        }
-        if start_line.is_some()
-            && matches!(
-                parse_sentinel_line(line_info.content, template, name),
-                Some((false, _))
-            )
-        {
-            end_line = Some(i);
-            break;
-        }
     }
 
-    if let (Some(start), Some(end)) = (start_line, end_line) {
-        let byte_start = line_infos[start].start;
-        let byte_end = line_infos[end].end;
-
-        // Extract content between sentinels
-        let block_content: String = line_infos[start + 1..end]
-            .iter()
-            .map(|line| line.content)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        return Some((byte_start..byte_end, start_timestamp, block_content));
+    #[test]
+    fn find_block_crlf() {
+        let content = "before\r\n# >>> n:1 >>>\r\nbody\r\n# <<< n:1 <<<\r\nafter\r\n";
+        let found = find_block("# {}", "n", content).unwrap().unwrap();
+        assert_eq!(found.timestamp, 1);
     }
 
-    None
-}
-
-/// Compute SHA256 hash
-fn compute_hash(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn get_local_mtime(path: &Path) -> Result<i64> {
-    let metadata = std::fs::metadata(path)?;
-    let mtime = metadata.modified()?;
-    let duration = mtime.duration_since(UNIX_EPOCH)?;
-    Ok(duration.as_secs() as i64)
-}
-
-struct LineInfo<'a> {
-    content: &'a str,
-    start: usize,
-    end: usize,
-}
-
-fn collect_lines_with_offsets(content: &str) -> Vec<LineInfo<'_>> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-
-    for segment in content.split_inclusive('\n') {
-        let end = start + segment.len();
-        let content = segment.trim_end_matches(['\n', '\r']);
-        lines.push(LineInfo {
-            content,
-            start,
-            end,
-        });
-        start = end;
+    #[test]
+    fn find_block_orphan_open_is_error() {
+        let content = "# >>> n:1 >>>\nbody\n";
+        let err = find_block("# {}", "n", content).unwrap_err();
+        assert!(matches!(err, BlockError::MalformedSentinel { .. }));
     }
 
-    if start < content.len() {
-        lines.push(LineInfo {
-            content: &content[start..],
-            start,
-            end: content.len(),
-        });
+    #[test]
+    fn find_block_does_not_match_inside_body() {
+        let content = "# >>> a:1 >>>\nthis line says >>> a:2 >>> as text\n# <<< a:1 <<<\n";
+        let found = find_block("# {}", "a", content).unwrap().unwrap();
+        assert_eq!(found.timestamp, 1);
     }
 
-    lines
-}
-
-fn parse_sentinel_line(line: &str, template: &str, name: &str) -> Option<(bool, i64)> {
-    let (prefix, suffix) = template.split_once("{}")?;
-    let trimmed = line.trim();
-
-    if !trimmed.starts_with(prefix) || !trimmed.ends_with(suffix) {
-        return None;
+    #[test]
+    fn compose_inserts_when_missing() {
+        let output = compose(
+            "alpha\n",
+            "beta\n",
+            &Sentinel {
+                name: "n".into(),
+                timestamp: 1,
+                open_marker: "# >>> n:1 >>>".into(),
+                close_marker: "# <<< n:1 <<<".into(),
+            },
+            "# {}",
+            "n",
+        )
+        .unwrap();
+        assert_eq!(output, "alpha\n# >>> n:1 >>>\nbeta\n# <<< n:1 <<<\n");
     }
 
-    let inner = &trimmed[prefix.len()..trimmed.len() - suffix.len()];
-    let inner = inner.trim();
-
-    if let Some(timestamp) = inner
-        .strip_prefix(&format!(">>> {}:", name))
-        .and_then(|rest| rest.strip_suffix(" >>>"))
-    {
-        return timestamp.trim().parse::<i64>().ok().map(|ts| (true, ts));
+    #[test]
+    fn compose_replaces_existing() {
+        let pre = "x\n# >>> n:1 >>>\nold body\n# <<< n:1 <<<\ny\n";
+        let output = compose(
+            pre,
+            "new body\n",
+            &Sentinel {
+                name: "n".into(),
+                timestamp: 2,
+                open_marker: "# >>> n:2 >>>".into(),
+                close_marker: "# <<< n:2 <<<".into(),
+            },
+            "# {}",
+            "n",
+        )
+        .unwrap();
+        assert_eq!(output, "x\n# >>> n:2 >>>\nnew body\n# <<< n:2 <<<\ny\n");
     }
-
-    if let Some(timestamp) = inner
-        .strip_prefix(&format!("<<< {}:", name))
-        .and_then(|rest| rest.strip_suffix(" <<<"))
-    {
-        return timestamp.trim().parse::<i64>().ok().map(|ts| (false, ts));
-    }
-
-    None
 }

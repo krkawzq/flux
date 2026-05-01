@@ -1,10 +1,8 @@
 //! Block injection stage.
 
 use crate::config::{BlockItem, SyncMode};
-use crate::output::{self, Status};
 use crate::path::FluxPath;
 use crate::remote::RemoteOps;
-use crate::remote::ssh::SshClient;
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
 use chrono::{DateTime, Utc};
@@ -67,9 +65,7 @@ pub fn find_block(
                     open = Some((byte, byte + piece.len(), timestamp));
                 }
             }
-        } else if close.is_none()
-            && line.starts_with(&prefix_close)
-            && line.ends_with(suffix_close)
+        } else if close.is_none() && line.starts_with(&prefix_close) && line.ends_with(suffix_close)
         {
             let mid = &line[prefix_close.len()..line.len() - suffix_close.len()];
             if mid.parse::<i64>().is_ok() {
@@ -216,7 +212,9 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
                     reason: SkipReason::ContentUnchanged,
                 }
             } else {
-                let local_mtime = std::fs::metadata(&local_path).and_then(|m| m.modified()).ok();
+                let local_mtime = std::fs::metadata(&local_path)
+                    .and_then(|m| m.modified())
+                    .ok();
                 let remote_mtime = remote.mtime(&target).await.ok();
                 if let (Some(remote_time), Some(local_time)) = (remote_mtime, local_mtime) {
                     let local_time: DateTime<Utc> = local_time.into();
@@ -355,62 +353,6 @@ fn action_name(action: &BlockAction) -> String {
         BlockAction::Skip { item_name, .. }
         | BlockAction::Apply { item_name, .. }
         | BlockAction::Failed { item_name, .. } => item_name.clone(),
-    }
-}
-
-#[derive(Debug)]
-pub struct BlockResult {
-    pub status: Status,
-    pub reason: Option<String>,
-}
-
-/// Transitional wrapper until `sync::mod` is rewritten to Pipeline.
-pub async fn sync_blocks(
-    client: &SshClient,
-    blocks: &[BlockItem],
-    default_comment_template: &str,
-) -> anyhow::Result<Vec<BlockResult>> {
-    let reporter = crate::reporter::memory::CapturedReporter::new();
-    let actions = plan_blocks(blocks, Path::new(""), default_comment_template, client).await;
-    let mut results = Vec::with_capacity(actions.len());
-
-    for action in &actions {
-        let name = action_name(action);
-        let outcome = execute_block(action, client, default_comment_template, &reporter).await;
-        let status = match &outcome {
-            ItemOutcome::Applied => Status::Success,
-            ItemOutcome::Skipped(_) => Status::Skip,
-            ItemOutcome::Failed(_) => Status::Failed,
-        };
-        let reason = match &outcome {
-            ItemOutcome::Applied => None,
-            ItemOutcome::Skipped(reason) => Some(skip_reason_text(reason)),
-            ItemOutcome::Failed(error) => Some(error.clone()),
-        };
-
-        let target = match action {
-            BlockAction::Apply { target, .. } => format!(":{target}"),
-            _ => blocks
-                .iter()
-                .find(|block| block.name == name)
-                .map(|block| block.file.clone())
-                .unwrap_or_default(),
-        };
-        output::print_block(&name, &target);
-        output::print_block_result(status, reason.as_deref());
-
-        results.push(BlockResult { status, reason });
-    }
-
-    Ok(results)
-}
-
-fn skip_reason_text(reason: &SkipReason) -> String {
-    match reason {
-        SkipReason::AlreadyExists => "already exists".into(),
-        SkipReason::RemoteNewer => "remote newer".into(),
-        SkipReason::ContentUnchanged => "content unchanged".into(),
-        SkipReason::DependencyFailed(dep) => format!("dep {dep} failed"),
     }
 }
 

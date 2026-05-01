@@ -121,7 +121,9 @@ impl RemoteOps for InMemoryRemote {
         guard.write_calls.push((path.to_string(), data.to_vec()));
         guard.files.insert(path.to_string(), data.to_vec());
         let prev = guard.mtimes.get(path).copied();
-        let next = prev.map(|t| t + Duration::seconds(1)).unwrap_or_else(Utc::now);
+        let next = prev
+            .map(|t| t + Duration::seconds(1))
+            .unwrap_or_else(Utc::now);
         guard.mtimes.insert(path.to_string(), next);
         Ok(())
     }

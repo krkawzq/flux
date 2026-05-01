@@ -2,6 +2,8 @@
 //!
 //! Defines the YAML configuration structure for flux sync operations.
 
+pub mod version;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -11,6 +13,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_version")]
+    pub version: u32,
     // === SSH Configuration ===
     /// SSH host address (interactive if missing)
     pub host: Option<String>,
@@ -54,6 +58,10 @@ pub struct Config {
     /// Block sync rules
     #[serde(default)]
     pub block: Vec<BlockItem>,
+}
+
+fn default_version() -> u32 {
+    1
 }
 
 fn default_interpreter() -> String {
@@ -180,6 +188,7 @@ impl Config {
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
+        version::probe_version(&content).map_err(|err| anyhow::anyhow!("{err}"))?;
         let config: Config = serde_yml::from_str(&content)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
         Ok(config)

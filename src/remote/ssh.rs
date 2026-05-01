@@ -447,7 +447,9 @@ impl SshClient {
     /// Check if a remote file exists
     pub async fn file_exists(&self, remote_path: &str) -> Result<bool> {
         let escaped_path = shell_escape(remote_path);
-        let result = self.exec_command(&format!("test -f {}", escaped_path)).await?;
+        let result = self
+            .exec_command(&format!("test -f {}", escaped_path))
+            .await?;
         Ok(result.exit_code == 0)
     }
 
@@ -569,9 +571,7 @@ impl RemoteOps for SshClient {
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, RemoteOpsError> {
-        self.read_remote_file(path)
-            .await
-            .map_err(map_anyhow)
+        self.read_remote_file(path).await.map_err(map_anyhow)
     }
 
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), RemoteOpsError> {

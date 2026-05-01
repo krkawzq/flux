@@ -115,19 +115,19 @@ impl Reporter for ConsoleReporter {
     }
 
     fn warning(&self, msg: &str) {
-        let _ = self
-            .out
-            .lock()
-            .unwrap()
-            .write_line(&format!("{} {}", style("[warn]").yellow().bold(), msg));
+        let _ = self.out.lock().unwrap().write_line(&format!(
+            "{} {}",
+            style("[warn]").yellow().bold(),
+            msg
+        ));
     }
 
     fn info(&self, msg: &str) {
-        let _ = self
-            .out
-            .lock()
-            .unwrap()
-            .write_line(&format!("{} {}", style("[flux]").cyan().bold(), msg));
+        let _ = self.out.lock().unwrap().write_line(&format!(
+            "{} {}",
+            style("[flux]").cyan().bold(),
+            msg
+        ));
     }
 }
 
@@ -143,12 +143,10 @@ fn skip_reason_label(reason: &SkipReason) -> String {
 fn print_file_action(reporter: &ConsoleReporter, action: &FileAction) {
     let out = reporter.out.lock().unwrap();
     let _ = match action {
-        FileAction::Skip { item_name, reason } => {
-            out.write_line(&format!(
-                "  [file] ⊘ skip   {item_name} ({})",
-                skip_reason_label(reason)
-            ))
-        }
+        FileAction::Skip { item_name, reason } => out.write_line(&format!(
+            "  [file] ⊘ skip   {item_name} ({})",
+            skip_reason_label(reason)
+        )),
         FileAction::Apply {
             item_name,
             dst,
@@ -169,12 +167,10 @@ fn print_file_action(reporter: &ConsoleReporter, action: &FileAction) {
 fn print_script_action(reporter: &ConsoleReporter, action: &ScriptAction) {
     let out = reporter.out.lock().unwrap();
     let _ = match action {
-        ScriptAction::Skip { item_name, reason } => {
-            out.write_line(&format!(
-                "  [script] ⊘ skip   {item_name} ({})",
-                skip_reason_label(reason)
-            ))
-        }
+        ScriptAction::Skip { item_name, reason } => out.write_line(&format!(
+            "  [script] ⊘ skip   {item_name} ({})",
+            skip_reason_label(reason)
+        )),
         ScriptAction::Run { item_name, .. } => {
             out.write_line(&format!("  [script] ✓ run    {item_name}"))
         }
@@ -187,12 +183,10 @@ fn print_script_action(reporter: &ConsoleReporter, action: &ScriptAction) {
 fn print_block_action(reporter: &ConsoleReporter, action: &BlockAction) {
     let out = reporter.out.lock().unwrap();
     let _ = match action {
-        BlockAction::Skip { item_name, reason } => {
-            out.write_line(&format!(
-                "  [block] ⊘ skip   {item_name} ({})",
-                skip_reason_label(reason)
-            ))
-        }
+        BlockAction::Skip { item_name, reason } => out.write_line(&format!(
+            "  [block] ⊘ skip   {item_name} ({})",
+            skip_reason_label(reason)
+        )),
         BlockAction::Apply {
             item_name, target, ..
         } => out.write_line(&format!("  [block] ✓ apply  {item_name} -> {target}")),

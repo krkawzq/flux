@@ -1,0 +1,9 @@
+version: 1
+host: "127.0.0.1"
+user: "test"
+key: ~/.ssh/test_key
+interpreter: /bin/bash
+comment_template: "# {}"
+file: []
+script: []
+block: []

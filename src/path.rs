@@ -53,10 +53,10 @@ impl FluxPath {
         match self {
             FluxPath::Local(path) => {
                 let path_str = path.to_string_lossy();
-                if path_str.starts_with('~') {
+                if let Some(stripped) = path_str.strip_prefix('~') {
                     let home = dirs::home_dir()
                         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-                    let rest = path_str.strip_prefix("~/").unwrap_or(&path_str[1..]);
+                    let rest = path_str.strip_prefix("~/").unwrap_or(stripped);
                     Ok(home.join(rest))
                 } else if path.is_absolute() {
                     Ok(path.clone())
@@ -123,5 +123,54 @@ mod tests {
         let path = FluxPath::parse(":/etc/hosts");
         assert!(path.is_remote());
         assert_eq!(path.as_str(), "/etc/hosts");
+    }
+}
+
+/// Resolve config-relative asset paths under `<flux_home>/{files,scripts,blocks}/`.
+pub struct AssetLocator {
+    root: std::path::PathBuf,
+}
+
+impl AssetLocator {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn file(&self, name: &str) -> std::path::PathBuf {
+        self.root.join("files").join(name)
+    }
+
+    pub fn script(&self, name: &str) -> std::path::PathBuf {
+        self.root.join("scripts").join(name)
+    }
+
+    pub fn block(&self, name: &str) -> std::path::PathBuf {
+        self.root.join("blocks").join(name)
+    }
+
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    #[test]
+    fn locator_paths() {
+        let locator = AssetLocator::new("/x/.flux");
+        assert_eq!(
+            locator.file("a.txt").as_path(),
+            std::path::Path::new("/x/.flux/files/a.txt")
+        );
+        assert_eq!(
+            locator.script("s.sh").as_path(),
+            std::path::Path::new("/x/.flux/scripts/s.sh")
+        );
+        assert_eq!(
+            locator.block("b.sh").as_path(),
+            std::path::Path::new("/x/.flux/blocks/b.sh")
+        );
     }
 }

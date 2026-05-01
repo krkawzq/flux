@@ -6,8 +6,14 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub enum CapturedEvent {
-    StageStarted { stage: Stage, items: usize },
-    ItemStarted { stage: Stage, name: String },
+    StageStarted {
+        stage: Stage,
+        items: usize,
+    },
+    ItemStarted {
+        stage: Stage,
+        name: String,
+    },
     ItemFinished {
         stage: Stage,
         name: String,

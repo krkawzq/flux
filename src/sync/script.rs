@@ -1,9 +1,7 @@
 //! Script execution stage.
 
 use crate::config::ScriptItem;
-use crate::output::{self, Status};
 use crate::remote::RemoteOps;
-use crate::remote::ssh::SshClient;
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{ScriptAction, SkipReason};
 use std::collections::HashMap;
@@ -178,63 +176,6 @@ fn resolve_script_path(asset_root: &Path, path: &str) -> PathBuf {
         asset_root.join(remote)
     } else {
         asset_root.join(path)
-    }
-}
-
-#[derive(Debug)]
-pub struct ScriptResult {
-    pub status: Status,
-    pub reason: Option<String>,
-}
-
-/// Transitional wrapper until `sync::mod` is rewritten to Pipeline.
-pub async fn exec_scripts(
-    client: &SshClient,
-    scripts: &[ScriptItem],
-    file_status: &HashMap<String, bool>,
-    default_interpreter: &str,
-    default_flags: &[String],
-) -> anyhow::Result<Vec<ScriptResult>> {
-    let reporter = crate::reporter::memory::CapturedReporter::new();
-    let actions = plan_scripts(
-        scripts,
-        file_status,
-        Path::new(""),
-        default_interpreter,
-        default_flags,
-    )
-    .await;
-    let mut results = Vec::with_capacity(actions.len());
-
-    for action in &actions {
-        let display_name = action_name(action);
-        let outcome = execute_script(action, client, &reporter).await;
-        let status = match &outcome {
-            ItemOutcome::Applied => Status::Success,
-            ItemOutcome::Skipped(_) => Status::Skip,
-            ItemOutcome::Failed(_) => Status::Failed,
-        };
-        let reason = match &outcome {
-            ItemOutcome::Applied => None,
-            ItemOutcome::Skipped(reason) => Some(skip_reason_text(reason)),
-            ItemOutcome::Failed(error) => Some(error.clone()),
-        };
-
-        output::print_script(&display_name);
-        output::print_script_result(status, reason.as_deref());
-
-        results.push(ScriptResult { status, reason });
-    }
-
-    Ok(results)
-}
-
-fn skip_reason_text(reason: &SkipReason) -> String {
-    match reason {
-        SkipReason::AlreadyExists => "already exists".into(),
-        SkipReason::RemoteNewer => "remote newer".into(),
-        SkipReason::ContentUnchanged => "content unchanged".into(),
-        SkipReason::DependencyFailed(dep) => format!("dep {dep} failed"),
     }
 }
 

@@ -11,9 +11,9 @@
 //!   pub mod reporter;   // Task 6
 //!   pub mod sync;       // Task 5+ (sync::plan, then file/script/block/mod)
 
+pub mod cli;
+pub mod config;
 pub mod path;
 pub mod remote;
 pub mod reporter;
-mod config;
-mod output;
 pub mod sync;

@@ -1,33 +1,289 @@
-//! Sync module
+//! Sync pipeline orchestration.
 //!
-//! Orchestrates the sync pipeline: file -> script -> block
+//! `Pipeline` holds references to `Config`, `RemoteOps`, and `Reporter`,
+//! computes a Plan, and executes it stage by stage with stage-level
+//! concurrency (file: parallel; script: serial; block: parallel by target).
 
-pub mod plan;
 pub mod block;
 pub mod file;
+pub mod plan;
 pub mod script;
 
 use crate::config::Config;
-use crate::output::{self, Status};
 use crate::remote::ssh::{SshClient, SshConfig};
+use crate::remote::{RemoteOps, RemoteOpsError};
+use crate::reporter::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
+use crate::sync::plan::{BlockAction, FileAction, Plan, RegisterPubkeyAction, ScriptAction};
 use anyhow::Result;
 use dialoguer::{Input, Password};
+use futures::stream::StreamExt;
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SyncError {
-    #[error("block: {0}")]
-    Block(#[from] block::BlockError),
     #[error("file: {0}")]
     File(#[from] file::FileError),
     #[error("script: {0}")]
     Script(#[from] script::ScriptError),
+    #[error("block: {0}")]
+    Block(#[from] block::BlockError),
     #[error("remote: {0}")]
-    Remote(#[from] crate::remote::RemoteOpsError),
+    Remote(#[from] RemoteOpsError),
 }
 
-/// SSH config info for saving to ~/.ssh/config
+#[derive(Debug, Clone)]
+pub struct PipelineOpts {
+    pub dry_run: bool,
+    pub max_concurrency: usize,
+}
+
+impl Default for PipelineOpts {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            max_concurrency: 8,
+        }
+    }
+}
+
+pub struct Pipeline<'a, R: RemoteOps + ?Sized> {
+    pub config: &'a Config,
+    pub asset_root: &'a Path,
+    pub remote: &'a R,
+    pub reporter: &'a dyn Reporter,
+    pub opts: PipelineOpts,
+}
+
+impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
+    pub async fn plan(&self) -> Plan {
+        let register_pubkey = self.config.register_key.then(|| RegisterPubkeyAction {
+            local_pubkey_path: self
+                .config
+                .key
+                .clone()
+                .map(|key| format!("{key}.pub"))
+                .unwrap_or_default(),
+            remote_authorized_keys: "~/.ssh/authorized_keys".into(),
+        });
+        let file_actions = file::plan_files(&self.config.file, self.remote).await;
+        let file_status: HashMap<String, bool> = file_actions
+            .iter()
+            .map(|action| match action {
+                FileAction::Apply { item_name, .. } | FileAction::Skip { item_name, .. } => {
+                    (item_name.clone(), true)
+                }
+                FileAction::Failed { item_name, .. } => (item_name.clone(), false),
+            })
+            .collect();
+        let script_actions = script::plan_scripts(
+            &self.config.script,
+            &file_status,
+            self.asset_root,
+            &self.config.interpreter,
+            self.config.flags.as_slice(),
+        )
+        .await;
+        let block_actions = block::plan_blocks(
+            &self.config.block,
+            self.asset_root,
+            &self.config.comment_template,
+            self.remote,
+        )
+        .await;
+        Plan {
+            register_pubkey,
+            file_actions,
+            script_actions,
+            block_actions,
+        }
+    }
+
+    pub async fn run(&self) -> PipelineSummary {
+        let plan = self.plan().await;
+        if self.opts.dry_run {
+            self.reporter.print_plan(&plan);
+            return PipelineSummary {
+                stages: vec![],
+                interrupted: false,
+                dry_run: true,
+            };
+        }
+        self.execute(&plan).await
+    }
+
+    pub async fn execute(&self, plan: &Plan) -> PipelineSummary {
+        let mut stages = Vec::new();
+        if let Some(action) = &plan.register_pubkey {
+            stages.push(self.execute_pubkey(action).await);
+        }
+        stages.push(self.execute_file_stage(&plan.file_actions).await);
+        stages.push(self.execute_script_stage(&plan.script_actions).await);
+        stages.push(self.execute_block_stage(&plan.block_actions).await);
+        let summary = PipelineSummary {
+            stages,
+            interrupted: false,
+            dry_run: false,
+        };
+        self.reporter.pipeline_summary(&summary);
+        summary
+    }
+
+    async fn execute_file_stage(&self, actions: &[FileAction]) -> StageSummary {
+        self.reporter.stage_started(Stage::File, actions.len());
+        let outcomes: Vec<ItemOutcome> =
+            futures::stream::iter(actions.iter())
+                .map(|action| async move {
+                    file::execute_file(action, self.remote, self.reporter).await
+                })
+                .buffer_unordered(self.opts.max_concurrency)
+                .collect()
+                .await;
+        let summary = tally(Stage::File, &outcomes);
+        self.reporter.stage_finished(&summary);
+        summary
+    }
+
+    async fn execute_script_stage(&self, actions: &[ScriptAction]) -> StageSummary {
+        self.reporter.stage_started(Stage::Script, actions.len());
+        let mut outcomes = Vec::with_capacity(actions.len());
+        for action in actions {
+            outcomes.push(script::execute_script(action, self.remote, self.reporter).await);
+        }
+        let summary = tally(Stage::Script, &outcomes);
+        self.reporter.stage_finished(&summary);
+        summary
+    }
+
+    async fn execute_block_stage(&self, actions: &[BlockAction]) -> StageSummary {
+        self.reporter.stage_started(Stage::Block, actions.len());
+        let mut by_target: HashMap<String, Vec<&BlockAction>> = HashMap::new();
+        for action in actions {
+            let key = match action {
+                BlockAction::Apply { target, .. } => target.clone(),
+                BlockAction::Skip { item_name, .. } | BlockAction::Failed { item_name, .. } => {
+                    format!("_special:{item_name}")
+                }
+            };
+            by_target.entry(key).or_default().push(action);
+        }
+
+        let template = self.config.comment_template.clone();
+        let outcomes_groups: Vec<Vec<ItemOutcome>> = futures::stream::iter(by_target.into_values())
+            .map(|group| async {
+                let mut outcomes = Vec::with_capacity(group.len());
+                for action in group {
+                    outcomes.push(
+                        block::execute_block(action, self.remote, &template, self.reporter).await,
+                    );
+                }
+                outcomes
+            })
+            .buffer_unordered(self.opts.max_concurrency)
+            .collect()
+            .await;
+        let outcomes: Vec<ItemOutcome> = outcomes_groups.into_iter().flatten().collect();
+        let summary = tally(Stage::Block, &outcomes);
+        self.reporter.stage_finished(&summary);
+        summary
+    }
+
+    async fn execute_pubkey(&self, action: &RegisterPubkeyAction) -> StageSummary {
+        self.reporter.stage_started(Stage::Pubkey, 1);
+        let result = async {
+            let pub_bytes = std::fs::read(&action.local_pubkey_path)
+                .map_err(|err| SyncError::Remote(RemoteOpsError::Io(err.to_string())))?;
+            let pub_str = String::from_utf8(pub_bytes)
+                .map_err(|err| SyncError::Remote(RemoteOpsError::Encoding(err.to_string())))?
+                .trim()
+                .to_string();
+            let target = action.remote_authorized_keys.clone();
+            let existing = match self.remote.read_file(&target).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(RemoteOpsError::NotFound(_)) => String::new(),
+                Err(err) => return Err(SyncError::Remote(err)),
+            };
+            if existing.lines().any(|line| line.trim() == pub_str) {
+                return Ok::<_, SyncError>(ItemOutcome::Skipped(
+                    crate::sync::plan::SkipReason::AlreadyExists,
+                ));
+            }
+            let mut new_content = existing;
+            if !new_content.is_empty() && !new_content.ends_with('\n') {
+                new_content.push('\n');
+            }
+            new_content.push_str(&pub_str);
+            new_content.push('\n');
+            self.remote
+                .write_file(&target, new_content.as_bytes())
+                .await?;
+            self.remote.chmod(&target, 0o600).await?;
+            Ok(ItemOutcome::Applied)
+        }
+        .await;
+
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(err) => ItemOutcome::Failed(err.to_string()),
+        };
+        self.reporter
+            .item_finished(Stage::Pubkey, "register_pubkey", &outcome);
+        let summary = tally(Stage::Pubkey, std::slice::from_ref(&outcome));
+        self.reporter.stage_finished(&summary);
+        summary
+    }
+}
+
+fn tally(stage: Stage, outcomes: &[ItemOutcome]) -> StageSummary {
+    let mut applied = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    for outcome in outcomes {
+        match outcome {
+            ItemOutcome::Applied => applied += 1,
+            ItemOutcome::Skipped(_) => skipped += 1,
+            ItemOutcome::Failed(_) => failed += 1,
+        }
+    }
+    StageSummary {
+        stage,
+        applied,
+        skipped,
+        failed,
+    }
+}
+
+/// Compatibility helper until CLI extraction lands in Task 12.
+pub async fn run_sync(config: Config, config_path: &Path) -> Result<SshConfigInfo> {
+    config.validate()?;
+    let config = resolve_config_paths(config, config_path);
+    let ssh_config = resolve_ssh_config(&config)?;
+    let info = SshConfigInfo {
+        host: ssh_config.host.clone(),
+        port: ssh_config.port,
+        user: ssh_config.user.clone(),
+        key: ssh_config.key_path.clone(),
+    };
+    let mut client = SshClient::connect(&ssh_config).await?;
+    if config.proxy.enabled {
+        client
+            .start_reverse_forward(config.proxy.local_port, config.proxy.remote_port)
+            .await?;
+    }
+    let reporter = crate::reporter::console::ConsoleReporter::new();
+    let asset_root = config.resolve_root(config_path);
+    let pipeline = Pipeline {
+        config: &config,
+        asset_root: &asset_root,
+        remote: &client,
+        reporter: &reporter,
+        opts: PipelineOpts::default(),
+    };
+    let _ = pipeline.run().await;
+    client.close().await?;
+    Ok(info)
+}
+
 pub struct SshConfigInfo {
     pub host: String,
     pub port: u16,
@@ -35,186 +291,40 @@ pub struct SshConfigInfo {
     pub key: Option<String>,
 }
 
-/// Run the sync pipeline
-pub async fn run_sync(config: Config, config_path: &std::path::Path) -> Result<SshConfigInfo> {
-    config.validate()?;
-
-    // Preprocess config paths - resolve relative paths to .flux subdirectories
-    let config = resolve_config_paths(config, config_path);
-
-    // Resolve SSH connection parameters (with interactive prompts)
-    let ssh_config = resolve_ssh_config(&config)?;
-
-    // Save config info for later
-    let config_info = SshConfigInfo {
-        host: ssh_config.host.clone(),
-        port: ssh_config.port,
-        user: ssh_config.user.clone(),
-        key: ssh_config.key_path.clone(),
-    };
-
-    // Phase 1: Connect
-    output::print_header(&format!(
-        "Connecting to {}@{}:{}...",
-        ssh_config.user, ssh_config.host, ssh_config.port
-    ));
-
-    let mut client = SshClient::connect(&ssh_config).await?;
-    output::print_status(Status::Success, "SSH connection established");
-
-    let mut total_success = 0;
-    let mut total_failed = 0;
-    let mut total_skipped = 0;
-
-    // Register key first (before proxy, so it always runs)
-    if config.register_key {
-        if let Some(key_path) = &config.key {
-            if let Err(err) = register_public_key(&client, key_path).await {
-                output::print_warning(&format!("Failed to register public key: {}", err));
-                total_failed += 1;
-            }
-        }
-    }
-
-    // Phase 1.5: Setup proxy if enabled
-    if config.proxy.enabled {
-        output::print_header(&format!(
-            "Setting up proxy tunnel (local:{} → remote:{})...",
-            config.proxy.local_port, config.proxy.remote_port
-        ));
-
-        // Start reverse port forwarding
-        match client
-            .start_reverse_forward(config.proxy.local_port, config.proxy.remote_port)
-            .await
-        {
-            Ok(_) => {
-                output::print_status(
-                    Status::Success,
-                    &format!(
-                        "Proxy tunnel established (remote 127.0.0.1:{} → local {})",
-                        config.proxy.remote_port, config.proxy.local_port
-                    ),
-                );
-            }
-            Err(e) => {
-                output::print_error(&format!("Failed to setup proxy tunnel: {}", e));
-                output::print_info("Proxy is required for this sync, exiting...");
-                client.close().await?;
-                anyhow::bail!("Proxy tunnel setup failed");
-            }
-        }
-    }
-
-    println!();
-
-    // Phase 2: Sync pipeline
-    // 2.1: File sync
-    let mut file_status = std::collections::HashMap::new();
-    if !config.file.is_empty() {
-        let (file_results, statuses) = file::sync_files(&client, &config.file).await?;
-        file_status = statuses;
-
-        for r in &file_results {
-            match r.status {
-                Status::Success => total_success += 1,
-                Status::Failed => total_failed += 1,
-                Status::Skip => total_skipped += 1,
-            }
-        }
-
-        println!();
-    }
-
-    // 2.2: Script execution
-    if !config.script.is_empty() {
-        let script_results = script::exec_scripts(
-            &client,
-            &config.script,
-            &file_status,
-            &config.interpreter,
-            &config.flags,
-        )
-        .await?;
-
-        for r in &script_results {
-            match r.status {
-                Status::Success => total_success += 1,
-                Status::Failed => total_failed += 1,
-                Status::Skip => total_skipped += 1,
-            }
-        }
-
-        println!();
-    }
-
-    // 2.3: Block sync
-    if !config.block.is_empty() {
-        let block_results =
-            block::sync_blocks(&client, &config.block, &config.comment_template).await?;
-
-        for r in &block_results {
-            match r.status {
-                Status::Success => total_success += 1,
-                Status::Failed => total_failed += 1,
-                Status::Skip => total_skipped += 1,
-            }
-        }
-    }
-
-    // Summary
-    output::print_summary(total_success, total_failed, total_skipped);
-
-    // Close connection
-    client.close().await?;
-
-    Ok(config_info)
-}
-
-/// Resolve SSH config with interactive prompts for missing values
 fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
     let host = match &config.host {
-        Some(h) if !h.is_empty() => h.clone(),
+        Some(host) if !host.is_empty() => host.clone(),
         _ => Input::new().with_prompt("Host").interact_text()?,
     };
-
     let port = match config.port {
-        Some(p) if p > 0 => p,
+        Some(port) if port > 0 => port,
         _ => Input::new()
             .with_prompt("Port")
             .default(22u16)
             .interact_text()?,
     };
-
     let user = match &config.user {
-        Some(u) if !u.is_empty() => u.clone(),
+        Some(user) if !user.is_empty() => user.clone(),
         _ => Input::new()
             .with_prompt("User")
             .default("root".to_string())
             .interact_text()?,
     };
-
-    // Key is optional, no prompt
     let key_path = config.key.clone();
-
-    // Password: only prompt if no key or key doesn't exist
     let password = match &config.password {
-        Some(p) if !p.is_empty() => Some(p.clone()),
+        Some(password) if !password.is_empty() => Some(password.clone()),
         _ => {
-            let need_password = key_path.as_ref().map_or(true, |k| {
-                let expanded = expand_tilde(k);
+            let need_password = key_path.as_ref().is_none_or(|key| {
+                let expanded = expand_tilde(key);
                 !std::path::Path::new(&expanded).exists()
             });
-
             if need_password {
-                let pw = Password::new().with_prompt("Password").interact()?;
-                Some(pw)
+                Some(Password::new().with_prompt("Password").interact()?)
             } else {
                 None
             }
         }
     };
-
     Ok(SshConfig {
         host,
         port,
@@ -224,75 +334,6 @@ fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
     })
 }
 
-/// Register public key to authorized_keys
-async fn register_public_key(client: &SshClient, key_path: &str) -> Result<()> {
-    let pub_key_path = format!("{}.pub", key_path);
-    let expanded_path = expand_tilde(&pub_key_path);
-
-    output::print_header("Registering public key...");
-
-    if !std::path::Path::new(&expanded_path).exists() {
-        output::print_warning(&format!("Public key not found: {}", expanded_path));
-        return Ok(());
-    }
-
-    let pub_key = std::fs::read_to_string(&expanded_path)?;
-    let pub_key = pub_key.trim();
-
-    // Extract key fingerprint for checking
-    let key_parts: Vec<&str> = pub_key.split_whitespace().collect();
-    if key_parts.len() < 2 {
-        output::print_warning("Invalid public key format");
-        return Ok(());
-    }
-    let key_fingerprint = key_parts[1];
-
-    // Ensure .ssh directory exists with correct permissions
-    client.exec("mkdir -p ~/.ssh && chmod 700 ~/.ssh").await?;
-
-    // Read current authorized_keys content via SFTP
-    let auth_keys_path = "~/.ssh/authorized_keys";
-    let current_content = match client.read_remote_file(auth_keys_path).await {
-        Ok(content) => String::from_utf8_lossy(&content).to_string(),
-        Err(_) => String::new(), // File doesn't exist
-    };
-
-    // Check if key already exists by searching for the fingerprint
-    if current_content.contains(key_fingerprint) {
-        output::print_info("Public key already registered");
-        return Ok(());
-    }
-
-    // Write public key to a temp file first, then append
-    let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let temp_path = format!("/tmp/.flux_pubkey_{}_{}", pid, nanos);
-    client
-        .write_remote_file(&temp_path, pub_key.as_bytes())
-        .await?;
-
-    // Append temp file to authorized_keys and set permissions
-    let result = client
-        .exec(&format!(
-            "cat {} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f {}",
-            shell_quote(&temp_path),
-            shell_quote(&temp_path)
-        ))
-        .await?;
-
-    if result.exit_code != 0 {
-        let _ = client
-            .exec(&format!("rm -f {}", shell_quote(&temp_path)))
-            .await;
-        output::print_warning(&format!("Failed to append key: {}", result.stderr));
-        return Ok(());
-    }
-
-    output::print_status(Status::Success, "Public key registered");
-    Ok(())
-}
-
-/// Expand ~ to home directory
 fn expand_tilde(path: &str) -> String {
     if path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -306,54 +347,37 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// Resolve config paths - map relative paths to .flux subdirectories
 fn resolve_config_paths(mut config: Config, config_path: &Path) -> Config {
     let flux_dir = config.resolve_root(config_path);
 
-    // Helper to resolve a local path
     let resolve_local = |path: &str, subdir: &str| -> String {
-        // Skip remote paths (starting with :) and absolute paths
         if path.starts_with(':') || path.starts_with('/') || path.starts_with('~') {
             return path.to_string();
         }
-
-        // Skip if path contains directory separators (already has path)
         if path.contains('/') || path.contains('\\') {
-            // But still try to resolve relative to flux_dir
             let full_path = flux_dir.join(path);
             if full_path.exists() {
                 return full_path.to_string_lossy().to_string();
             }
             return path.to_string();
         }
-
-        // Try .flux/<subdir>/<path> first
         let subdir_path = flux_dir.join(subdir).join(path);
         if subdir_path.exists() {
             return subdir_path.to_string_lossy().to_string();
         }
-
-        // Try .flux/<path> directly
         let direct_path = flux_dir.join(path);
         if direct_path.exists() {
             return direct_path.to_string_lossy().to_string();
         }
-
-        // Fallback: return as-is (will fail later with clear error)
         path.to_string()
     };
 
-    // Resolve file sources
     for file in &mut config.file {
         file.src = resolve_local(&file.src, "files");
     }
-
-    // Resolve script paths
     for script in &mut config.script {
         script.path = resolve_local(&script.path, "scripts");
     }
-
-    // Resolve block paths
     for block in &mut config.block {
         block.path = resolve_local(&block.path, "blocks");
     }
@@ -361,10 +385,111 @@ fn resolve_config_paths(mut config: Config, config_path: &Path) -> Config {
     config
 }
 
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FileItem, ProxyConfig, SyncMode};
+    use crate::remote::fake::InMemoryRemote;
+    use crate::reporter::memory::CapturedReporter;
+    use tempfile::TempDir;
+
+    fn minimal_config(items: Vec<FileItem>) -> Config {
+        Config {
+            version: 1,
+            host: Some("127.0.0.1".into()),
+            port: Some(22),
+            user: Some("u".into()),
+            password: None,
+            key: None,
+            register_key: false,
+            interpreter: "/bin/bash".into(),
+            flags: vec![],
+            comment_template: "# {}".into(),
+            proxy: ProxyConfig::default(),
+            file: items,
+            script: vec![],
+            block: vec![],
+            flux_home: None,
+        }
     }
 
-    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+    #[tokio::test]
+    async fn empty_config_yields_empty_summary() {
+        let tmp = TempDir::new().unwrap();
+        let config = minimal_config(vec![]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts::default(),
+        };
+        let summary = pipe.run().await;
+        assert_eq!(summary.total_failed(), 0);
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            mode: SyncMode::Cover,
+            chmod: None,
+        }]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                dry_run: true,
+                max_concurrency: 4,
+            },
+        };
+        let _ = pipe.run().await;
+        assert_eq!(remote.write_calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn file_failure_does_not_short_circuit() {
+        let tmp = TempDir::new().unwrap();
+        let good = tmp.path().join("good");
+        std::fs::write(&good, b"ok").unwrap();
+        let config = minimal_config(vec![
+            FileItem {
+                name: Some("missing".into()),
+                src: "/no/such".into(),
+                dst: ":/r/x".into(),
+                mode: SyncMode::Cover,
+                chmod: None,
+            },
+            FileItem {
+                name: Some("good".into()),
+                src: good.to_string_lossy().into_owned(),
+                dst: ":/r/y".into(),
+                mode: SyncMode::Cover,
+                chmod: None,
+            },
+        ]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts::default(),
+        };
+        let summary = pipe.run().await;
+        assert_eq!(summary.stages[0].failed, 1);
+        assert_eq!(summary.stages[0].applied, 1);
+    }
 }

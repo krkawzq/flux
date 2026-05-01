@@ -1,14 +1,11 @@
 //! File sync stage.
 
 use crate::config::{FileItem, SyncMode};
-use crate::output::{self, Status};
 use crate::path::FluxPath;
 use crate::remote::{RemoteOps, RemoteOpsError};
-use crate::remote::ssh::SshClient;
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{FileAction, SkipReason};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -133,10 +130,12 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
                 },
                 Ok(remote_mtime) if remote_mtime == local_mtime => {
                     match remote.read_file(&remote_path).await {
-                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&bytes) => FileAction::Skip {
-                            item_name,
-                            reason: SkipReason::ContentUnchanged,
-                        },
+                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&bytes) => {
+                            FileAction::Skip {
+                                item_name,
+                                reason: SkipReason::ContentUnchanged,
+                            }
+                        }
                         Ok(_) => FileAction::Apply {
                             item_name,
                             dst: remote_path,
@@ -242,84 +241,6 @@ fn parent_dir(path: &str) -> Option<&str> {
     })
 }
 
-#[derive(Debug)]
-pub struct FileSyncResult {
-    pub name: Option<String>,
-    pub status: Status,
-    pub reason: Option<String>,
-}
-
-/// Transitional wrapper until `sync::mod` is rewritten to Pipeline.
-pub async fn sync_files(
-    client: &SshClient,
-    files: &[FileItem],
-) -> anyhow::Result<(Vec<FileSyncResult>, HashMap<String, bool>)> {
-    let actions = plan_files(files, client).await;
-    let reporter = crate::reporter::memory::CapturedReporter::new();
-    let mut results = Vec::with_capacity(actions.len());
-    let mut file_status = HashMap::new();
-
-    for action in &actions {
-        let outcome = execute_file(action, client, &reporter).await;
-        let name = match action {
-            FileAction::Skip { item_name, .. }
-            | FileAction::Apply { item_name, .. }
-            | FileAction::Failed { item_name, .. } => Some(item_name.clone()),
-        };
-        let status = match &outcome {
-            ItemOutcome::Applied => Status::Success,
-            ItemOutcome::Skipped(_) => Status::Skip,
-            ItemOutcome::Failed(_) => Status::Failed,
-        };
-        let reason = match &outcome {
-            ItemOutcome::Applied => None,
-            ItemOutcome::Skipped(reason) => Some(skip_reason_text(reason)),
-            ItemOutcome::Failed(error) => Some(error.clone()),
-        };
-
-        if let Some(action_name) = &name {
-            file_status.insert(action_name.clone(), matches!(outcome, ItemOutcome::Applied));
-        }
-
-        let src_path = FluxPath::parse(match action {
-            FileAction::Skip { item_name, .. }
-            | FileAction::Apply { item_name, .. }
-            | FileAction::Failed { item_name, .. } => files
-                .iter()
-                .find(|file| file.name.as_deref().unwrap_or(&file.src) == item_name)
-                .map(|file| file.src.as_str())
-                .unwrap_or(item_name),
-        });
-        let dst_display = match action {
-            FileAction::Apply { dst, .. } => format!(":{dst}"),
-            _ => files
-                .iter()
-                .find(|file| file.name.as_deref().unwrap_or(&file.src) == name.as_deref().unwrap_or(""))
-                .map(|file| file.dst.clone())
-                .unwrap_or_default(),
-        };
-        output::print_file(&src_path.as_str(), &dst_display);
-        output::print_file_result(status, reason.as_deref());
-
-        results.push(FileSyncResult {
-            name,
-            status,
-            reason,
-        });
-    }
-
-    Ok((results, file_status))
-}
-
-fn skip_reason_text(reason: &SkipReason) -> String {
-    match reason {
-        SkipReason::AlreadyExists => "already exists".to_string(),
-        SkipReason::RemoteNewer => "remote newer".to_string(),
-        SkipReason::ContentUnchanged => "content unchanged".to_string(),
-        SkipReason::DependencyFailed(dep) => format!("dependency failed: {dep}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +311,10 @@ mod tests {
         let src = local_file(&tmp, "a.txt", b"same");
         let local_modified = std::fs::metadata(&src).unwrap().modified().unwrap();
         let remote = InMemoryRemote::with_files([("/r/a.txt", b"same".to_vec())]);
-        remote.set_mtime("/r/a.txt", chrono::DateTime::<chrono::Utc>::from(local_modified));
+        remote.set_mtime(
+            "/r/a.txt",
+            chrono::DateTime::<chrono::Utc>::from(local_modified),
+        );
         let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Sync)], &remote).await;
         assert!(matches!(
             &actions[0],

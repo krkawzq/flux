@@ -5,11 +5,17 @@
 use crate::config::{BlockItem, SyncMode};
 use crate::output::{self, Status};
 use crate::path::FluxPath;
-use crate::ssh::SshClient;
+use crate::remote::ssh::SshClient;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BlockError {
+    #[error("bad comment template")]
+    BadTemplate,
+}
 
 /// Result of a block sync operation
 #[derive(Debug)]

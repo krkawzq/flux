@@ -2,17 +2,30 @@
 //!
 //! Orchestrates the sync pipeline: file -> script -> block
 
+pub mod plan;
 pub mod block;
 pub mod file;
 pub mod script;
 
 use crate::config::Config;
 use crate::output::{self, Status};
-use crate::ssh::{SshClient, SshConfig};
+use crate::remote::ssh::{SshClient, SshConfig};
 use anyhow::Result;
 use dialoguer::{Input, Password};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SyncError {
+    #[error("block: {0}")]
+    Block(#[from] block::BlockError),
+    #[error("file: {0}")]
+    File(#[from] file::FileError),
+    #[error("script: {0}")]
+    Script(#[from] script::ScriptError),
+    #[error("remote: {0}")]
+    Remote(#[from] crate::remote::RemoteOpsError),
+}
 
 /// SSH config info for saving to ~/.ssh/config
 pub struct SshConfigInfo {

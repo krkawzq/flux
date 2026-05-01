@@ -3,7 +3,10 @@
 //! Handles SSH connections, authentication, command execution, file transfer,
 //! and reverse port forwarding.
 
+use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKey};
 use russh::{client, Channel, ChannelMsg, Disconnect};
 use std::io::Cursor;
@@ -256,7 +259,7 @@ impl SshClient {
     }
 
     /// Execute a command on the remote server
-    pub async fn exec(&self, command: &str) -> Result<ExecResult> {
+    pub async fn exec_command(&self, command: &str) -> Result<ExecResult> {
         let mut channel = self
             .session
             .channel_open_session()
@@ -298,6 +301,12 @@ impl SshClient {
             stdout: String::from_utf8_lossy(&stdout).to_string(),
             stderr: String::from_utf8_lossy(&stderr).to_string(),
         })
+    }
+
+    /// Compatibility wrapper while the rest of the codebase is still on the
+    /// pre-Phase-2 API surface.
+    pub async fn exec(&self, command: &str) -> Result<ExecResult> {
+        self.exec_command(command).await
     }
 
     /// Execute command with stdin/stdout streaming (with PTY)
@@ -426,7 +435,7 @@ impl SshClient {
     /// Read a remote file
     pub async fn read_remote_file(&self, remote_path: &str) -> Result<Vec<u8>> {
         let escaped_path = shell_escape(remote_path);
-        let result = self.exec(&format!("cat {}", escaped_path)).await?;
+        let result = self.exec_command(&format!("cat {}", escaped_path)).await?;
 
         if result.exit_code != 0 {
             anyhow::bail!("Failed to read remote file: {}", result.stderr);
@@ -438,7 +447,7 @@ impl SshClient {
     /// Check if a remote file exists
     pub async fn file_exists(&self, remote_path: &str) -> Result<bool> {
         let escaped_path = shell_escape(remote_path);
-        let result = self.exec(&format!("test -f {}", escaped_path)).await?;
+        let result = self.exec_command(&format!("test -f {}", escaped_path)).await?;
         Ok(result.exit_code == 0)
     }
 
@@ -446,7 +455,7 @@ impl SshClient {
     pub async fn get_mtime(&self, remote_path: &str) -> Result<Option<i64>> {
         let escaped_path = shell_escape(remote_path);
         let result = self
-            .exec(&format!(
+            .exec_command(&format!(
                 "stat -c %Y {} 2>/dev/null || stat -f %m {} 2>/dev/null",
                 escaped_path, escaped_path
             ))
@@ -461,10 +470,10 @@ impl SshClient {
     }
 
     /// Set file permissions on remote
-    pub async fn chmod(&self, remote_path: &str, mode: &str) -> Result<()> {
+    pub async fn chmod_remote(&self, remote_path: &str, mode: &str) -> Result<()> {
         let escaped_path = shell_escape(remote_path);
         let result = self
-            .exec(&format!("chmod {} {}", mode, escaped_path))
+            .exec_command(&format!("chmod {} {}", mode, escaped_path))
             .await?;
 
         if result.exit_code != 0 {
@@ -474,9 +483,14 @@ impl SshClient {
         Ok(())
     }
 
+    /// Compatibility wrapper while callers migrate to `RemoteOps::chmod`.
+    pub async fn chmod(&self, remote_path: &str, mode: &str) -> Result<()> {
+        self.chmod_remote(remote_path, mode).await
+    }
+
     /// Get the remote home directory
     pub async fn home_dir(&self) -> Result<String> {
-        let result = self.exec("echo $HOME").await?;
+        let result = self.exec_command("echo $HOME").await?;
         Ok(result.stdout.trim().to_string())
     }
 
@@ -538,4 +552,73 @@ fn expand_tilde(path: &str) -> String {
 /// Escape shell special characters
 fn shell_escape(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[async_trait]
+impl RemoteOps for SshClient {
+    async fn exec(&self, cmd: &str) -> Result<ExecOutput, RemoteOpsError> {
+        let out = self
+            .exec_command(cmd)
+            .await
+            .map_err(|e| RemoteOpsError::Transport(e.to_string()))?;
+        Ok(ExecOutput {
+            status: out.exit_code as i32,
+            stdout: out.stdout.into_bytes(),
+            stderr: out.stderr.into_bytes(),
+        })
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, RemoteOpsError> {
+        self.read_remote_file(path)
+            .await
+            .map_err(map_anyhow)
+    }
+
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), RemoteOpsError> {
+        self.write_remote_file(path, data).await.map_err(map_anyhow)
+    }
+
+    async fn exists(&self, path: &str) -> Result<bool, RemoteOpsError> {
+        self.file_exists(path).await.map_err(map_anyhow)
+    }
+
+    async fn mtime(&self, path: &str) -> Result<DateTime<Utc>, RemoteOpsError> {
+        let secs = self
+            .get_mtime(path)
+            .await
+            .map_err(map_anyhow)?
+            .ok_or_else(|| RemoteOpsError::NotFound(path.to_string()))?;
+        Utc.timestamp_opt(secs, 0)
+            .single()
+            .ok_or_else(|| RemoteOpsError::Encoding(format!("invalid mtime {secs}")))
+    }
+
+    async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError> {
+        self.chmod_remote(path, &format!("{mode:o}"))
+            .await
+            .map_err(map_anyhow)
+    }
+
+    async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError> {
+        let out = self
+            .exec_command(&format!("mkdir -p {}", shell_escape(path)))
+            .await
+            .map_err(map_anyhow)?;
+        if out.exit_code == 0 {
+            Ok(())
+        } else {
+            Err(RemoteOpsError::NonZeroExit {
+                status: out.exit_code as i32,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    async fn interactive_exec(&self, cmd: &str) -> Result<i32, RemoteOpsError> {
+        self.exec_interactive(cmd).await.map_err(map_anyhow)
+    }
+}
+
+fn map_anyhow(error: anyhow::Error) -> RemoteOpsError {
+    RemoteOpsError::Io(error.to_string())
 }

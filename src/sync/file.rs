@@ -5,11 +5,17 @@
 use crate::config::{FileItem, SyncMode};
 use crate::output::{self, Status};
 use crate::path::FluxPath;
-use crate::ssh::SshClient;
+use crate::remote::ssh::SshClient;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FileError {
+    #[error("file sync placeholder")]
+    Placeholder,
+}
 
 /// Result of a file sync operation
 #[derive(Debug)]

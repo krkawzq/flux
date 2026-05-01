@@ -5,10 +5,16 @@
 use crate::config::ScriptItem;
 use crate::output::{self, Status};
 use crate::path::FluxPath;
-use crate::ssh::SshClient;
+use crate::remote::ssh::SshClient;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScriptError {
+    #[error("script sync placeholder")]
+    Placeholder,
+}
 
 /// Result of a script execution
 #[derive(Debug)]

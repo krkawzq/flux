@@ -5,7 +5,7 @@
 mod config;
 mod output;
 mod path;
-mod ssh;
+mod remote;
 mod sync;
 
 use anyhow::Context;
@@ -290,7 +290,7 @@ async fn run_proxy(
             cached_password.clone()
         };
 
-        let ssh_config = ssh::SshConfig {
+        let ssh_config = remote::ssh::SshConfig {
             host: hostname.clone(),
             port,
             user: user.clone(),
@@ -299,7 +299,7 @@ async fn run_proxy(
         };
 
         // Connect
-        match ssh::SshClient::connect(&ssh_config).await {
+        match remote::ssh::SshClient::connect(&ssh_config).await {
             Ok(mut client) => {
                 output::print_status(output::Status::Success, "Connected");
 

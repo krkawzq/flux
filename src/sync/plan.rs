@@ -12,6 +12,7 @@ pub enum SkipReason {
     RemoteNewer,
     ContentUnchanged,
     FilteredOut,
+    PreviouslyApplied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

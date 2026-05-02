@@ -3,6 +3,7 @@
 
 pub mod console;
 pub mod memory;
+pub mod multi_host;
 
 use crate::sync::plan::{Plan, SkipReason};
 use crate::sync::SyncError;
@@ -45,6 +46,7 @@ pub struct PipelineSummary {
     pub stages: Vec<StageSummary>,
     pub interrupted: bool,
     pub dry_run: bool,
+    pub first_failed_item: Option<String>,
 }
 
 impl PipelineSummary {

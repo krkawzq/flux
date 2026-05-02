@@ -36,6 +36,14 @@ enum Commands {
         only_item: Vec<String>,
         #[arg(long, value_delimiter = ',')]
         tag: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long, default_value = "8")]
+        max_hosts: usize,
     },
     Undo {
         config: String,
@@ -75,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
             skip_stage,
             only_item,
             tag,
+            hosts,
+            no_cache,
+            resume,
+            max_hosts,
         } => {
             flux::cli::run_sync(
                 &config,
@@ -90,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
                     skip_stage,
                     only_item,
                     tag,
+                    hosts,
+                    no_cache,
+                    resume,
+                    max_hosts,
                 },
             )
             .await

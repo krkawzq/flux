@@ -23,6 +23,7 @@ struct Inner {
     dirs: HashSet<String>,
     exec_rules: Vec<ExecRule>,
     exec_calls: Vec<String>,
+    exists_calls: Vec<String>,
     interactive_calls: Vec<(String, Option<StdDuration>)>,
     interactive_exit_status: i32,
     write_calls: Vec<(String, Vec<u8>)>,
@@ -82,6 +83,10 @@ impl InMemoryRemote {
 
     pub fn write_calls(&self) -> Vec<(String, Vec<u8>)> {
         self.inner.lock().unwrap().write_calls.clone()
+    }
+
+    pub fn exists_calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().exists_calls.clone()
     }
 
     pub fn interactive_calls(&self) -> Vec<(String, Option<StdDuration>)> {
@@ -171,6 +176,7 @@ impl RemoteOps for InMemoryRemote {
         if let Some(err) = Self::take_failure(&mut guard, "exists") {
             return Err(err);
         }
+        guard.exists_calls.push(path.to_string());
         Ok(guard.files.contains_key(path) || guard.dirs.contains(path))
     }
 

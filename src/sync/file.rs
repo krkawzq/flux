@@ -1,5 +1,6 @@
 //! File sync stage.
 
+use crate::cli::state::HostState;
 use crate::config::{FileItem, ItemKind, SyncMode};
 use crate::path::FluxPath;
 use crate::remote::{with_retry, ExecOutput, RemoteOps, RemoteOpsError, RetryPolicy};
@@ -8,6 +9,7 @@ use crate::sync::plan::{FileAction, SkipReason};
 use chrono::Utc;
 use globset::Glob;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -27,7 +29,7 @@ pub enum FileError {
 }
 
 pub async fn plan_files<R: RemoteOps + ?Sized>(items: &[FileItem], remote: &R) -> Vec<FileAction> {
-    plan_files_with_concurrency(items, remote, 1, RetryPolicy::no_retry()).await
+    plan_files_with_concurrency(items, remote, 1, RetryPolicy::no_retry(), None, false).await
 }
 
 pub async fn plan_files_with_concurrency<R: RemoteOps + ?Sized>(
@@ -35,13 +37,20 @@ pub async fn plan_files_with_concurrency<R: RemoteOps + ?Sized>(
     remote: &R,
     max_concurrency: usize,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> Vec<FileAction> {
     use futures::stream::{self, StreamExt};
 
     let indexed: Vec<(usize, &FileItem)> = items.iter().enumerate().collect();
     let mut results: Vec<Option<Vec<FileAction>>> = (0..items.len()).map(|_| None).collect();
     let mut stream = stream::iter(indexed)
-        .map(|(idx, item)| async move { (idx, plan_one_file(item, remote, policy).await) })
+        .map(|(idx, item)| async move {
+            (
+                idx,
+                plan_one_file(item, remote, policy, state, use_cache).await,
+            )
+        })
         .buffer_unordered(max_concurrency.max(1));
 
     while let Some((idx, actions)) = stream.next().await {
@@ -74,13 +83,15 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(
     item: &FileItem,
     remote: &R,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> Vec<FileAction> {
     match effective_kind(item) {
         ItemKind::Auto => unreachable!("auto should resolve before dispatch"),
-        ItemKind::File => vec![plan_single_file(item, remote, policy).await],
-        ItemKind::Glob => plan_glob(item, remote, policy).await,
-        ItemKind::Dir => vec![plan_dir(item)],
-        ItemKind::Link => vec![plan_link(item)],
+        ItemKind::File => vec![plan_single_file(item, remote, policy, state, use_cache).await],
+        ItemKind::Glob => plan_glob(item, remote, policy, state, use_cache).await,
+        ItemKind::Dir => vec![plan_dir(item, state, use_cache)],
+        ItemKind::Link => vec![plan_link(item, state, use_cache)],
     }
 }
 
@@ -95,6 +106,8 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
     item: &FileItem,
     remote: &R,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let chmod = item
@@ -103,6 +116,19 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
         .and_then(|value| u32::from_str_radix(value, 8).ok());
     match resolve_local_remote(&item.src, &item.dst) {
         Ok((local_path, remote_path)) => {
+            if use_cache {
+                if let Some(hash) = hash_regular_file(&local_path) {
+                    if state
+                        .and_then(|state| state.item_hashes.get(&item_name))
+                        .is_some_and(|cached| cached == &hash)
+                    {
+                        return FileAction::Skip {
+                            item_name,
+                            reason: SkipReason::ContentUnchanged,
+                        };
+                    }
+                }
+            }
             plan_regular_file(
                 item_name,
                 local_path,
@@ -125,6 +151,8 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
     item: &FileItem,
     remote: &R,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> Vec<FileAction> {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let src = FluxPath::parse(&item.src);
@@ -192,6 +220,20 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
             });
         let dst = join_remote_path(&remote_base, &relative);
         let action_name = format!("{item_name}:{relative}");
+        if use_cache {
+            if let Some(hash) = hash_regular_file(&path) {
+                if state
+                    .and_then(|state| state.item_hashes.get(&action_name))
+                    .is_some_and(|cached| cached == &hash)
+                {
+                    actions.push(FileAction::Skip {
+                        item_name: action_name,
+                        reason: SkipReason::ContentUnchanged,
+                    });
+                    continue;
+                }
+            }
+        }
         actions.push(
             plan_regular_file(
                 action_name,
@@ -216,7 +258,7 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
     }
 }
 
-fn plan_dir(item: &FileItem) -> FileAction {
+fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let chmod = item
         .chmod
@@ -272,6 +314,19 @@ fn plan_dir(item: &FileItem) -> FileAction {
         files.push((path, relative));
     }
 
+    if use_cache {
+        let dir_hash = hash_dir_entries(&files);
+        if state
+            .and_then(|state| state.item_hashes.get(&item_name))
+            .is_some_and(|cached| cached == &dir_hash)
+        {
+            return FileAction::Skip {
+                item_name,
+                reason: SkipReason::ContentUnchanged,
+            };
+        }
+    }
+
     FileAction::ApplyDir {
         item_name,
         src_dir,
@@ -281,7 +336,7 @@ fn plan_dir(item: &FileItem) -> FileAction {
     }
 }
 
-fn plan_link(item: &FileItem) -> FileAction {
+fn plan_link(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.dst.clone());
     let dst = match FluxPath::parse(&item.dst) {
         FluxPath::Remote(path) => path,
@@ -302,11 +357,98 @@ fn plan_link(item: &FileItem) -> FileAction {
             error: FileError::InvalidPath("link kind requires target".into()).into(),
         };
     };
+    if use_cache {
+        let link_hash = hash_link_target(&target);
+        if state
+            .and_then(|state| state.item_hashes.get(&item_name))
+            .is_some_and(|cached| cached == &link_hash)
+        {
+            return FileAction::Skip {
+                item_name,
+                reason: SkipReason::ContentUnchanged,
+            };
+        }
+    }
     FileAction::ApplyLink {
         item_name,
         dst,
         target,
     }
+}
+
+pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    for item in items {
+        match effective_kind(item) {
+            ItemKind::File | ItemKind::Auto => {
+                let name = item.name.clone().unwrap_or_else(|| item.src.clone());
+                if let Ok((local_path, _)) = resolve_local_remote(&item.src, &item.dst) {
+                    if let Some(hash) = hash_regular_file(&local_path) {
+                        hashes.insert(name, hash);
+                    }
+                }
+            }
+            ItemKind::Glob => {
+                let name = item.name.clone().unwrap_or_else(|| item.src.clone());
+                let src = FluxPath::parse(&item.src);
+                if let FluxPath::Local(local_pattern) = src {
+                    if let Ok(glob) = Glob::new(&local_pattern.to_string_lossy()) {
+                        let matcher = glob.compile_matcher();
+                        let root = glob_search_root(&local_pattern);
+                        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+                            if !entry.file_type().is_file() {
+                                continue;
+                            }
+                            let path = entry.path().to_path_buf();
+                            if !matcher.is_match(&path) {
+                                continue;
+                            }
+                            let relative = path
+                                .strip_prefix(&root)
+                                .ok()
+                                .map(path_to_unix)
+                                .unwrap_or_else(|| {
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned()
+                                });
+                            if let Some(hash) = hash_regular_file(&path) {
+                                hashes.insert(format!("{name}:{relative}"), hash);
+                            }
+                        }
+                    }
+                }
+            }
+            ItemKind::Dir => {
+                let name = item.name.clone().unwrap_or_else(|| item.src.clone());
+                if let Ok((src_dir, _)) = resolve_local_remote(&item.src, &item.dst) {
+                    let files = WalkDir::new(&src_dir)
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_file())
+                        .map(|entry| {
+                            let path = entry.path().to_path_buf();
+                            let relative = path
+                                .strip_prefix(&src_dir)
+                                .ok()
+                                .map(path_to_unix)
+                                .unwrap_or_default();
+                            (path, relative)
+                        })
+                        .collect::<Vec<_>>();
+                    hashes.insert(name, hash_dir_entries(&files));
+                }
+            }
+            ItemKind::Link => {
+                let name = item.name.clone().unwrap_or_else(|| item.dst.clone());
+                if let Some(target) = &item.target {
+                    hashes.insert(name, hash_link_target(target));
+                }
+            }
+        }
+    }
+    hashes
 }
 
 async fn plan_regular_file<R: RemoteOps + ?Sized>(
@@ -565,6 +707,38 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
+}
+
+fn hash_hex(bytes: &[u8]) -> String {
+    hash(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_regular_file(path: &Path) -> Option<String> {
+    read_local_bytes(path).ok().map(|bytes| hash_hex(&bytes))
+}
+
+fn hash_dir_entries(files: &[(PathBuf, String)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, relative) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        if let Ok(bytes) = std::fs::read(path) {
+            hasher.update(&bytes);
+        }
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_link_target(target: &str) -> String {
+    hash_hex(target.as_bytes())
 }
 
 fn parent_dir(path: &str) -> Option<&str> {
@@ -989,6 +1163,8 @@ mod tests {
             &remote,
             1,
             RetryPolicy::default(),
+            None,
+            false,
         )
         .await;
         assert!(matches!(&actions[0], FileAction::Apply { .. }));

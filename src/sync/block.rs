@@ -1,5 +1,6 @@
 //! Block injection stage.
 
+use crate::cli::state::HostState;
 use crate::config::{BlockItem, SyncMode};
 use crate::path::FluxPath;
 use crate::remote::{with_retry, RemoteOps, RetryPolicy};
@@ -7,6 +8,7 @@ use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -110,10 +112,13 @@ pub async fn plan_blocks<R: RemoteOps + ?Sized>(
         remote,
         1,
         RetryPolicy::no_retry(),
+        None,
+        false,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
     items: &[BlockItem],
     asset_root: &Path,
@@ -121,6 +126,8 @@ pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
     remote: &R,
     max_concurrency: usize,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> Vec<BlockAction> {
     use futures::stream::{self, StreamExt};
 
@@ -130,7 +137,7 @@ pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
         .map(|(idx, item)| async move {
             (
                 idx,
-                plan_one_block(item, asset_root, template, remote, policy).await,
+                plan_one_block(item, asset_root, template, remote, policy, state, use_cache).await,
             )
         })
         .buffer_unordered(max_concurrency.max(1));
@@ -148,6 +155,8 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
     template: &str,
     remote: &R,
     policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> BlockAction {
     let item_name = item.name.clone();
     let local_path = resolve_block_path(asset_root, &item.path);
@@ -166,6 +175,17 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
             };
         }
     };
+    let local_hash = hash_string(&local_body);
+    if use_cache
+        && state
+            .and_then(|state| state.item_hashes.get(&item_name))
+            .is_some_and(|cached| cached == &local_hash)
+    {
+        return BlockAction::Skip {
+            item_name,
+            reason: SkipReason::ContentUnchanged,
+        };
+    }
 
     let target = match FluxPath::parse(&item.file) {
         FluxPath::Remote(path) => path,
@@ -295,6 +315,24 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
+}
+
+fn hash_string(value: &str) -> String {
+    hash(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn collect_item_hashes(items: &[BlockItem], asset_root: &Path) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    for item in items {
+        let local_path = resolve_block_path(asset_root, &item.path);
+        if let Ok(body) = std::fs::read_to_string(local_path) {
+            hashes.insert(item.name.clone(), hash_string(&body));
+        }
+    }
+    hashes
 }
 
 pub async fn execute_block<R: RemoteOps + ?Sized>(
@@ -523,6 +561,8 @@ mod tests {
             &remote,
             1,
             RetryPolicy::no_retry(),
+            None,
+            false,
         )
         .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -533,6 +573,8 @@ mod tests {
             &remote,
             1,
             RetryPolicy::no_retry(),
+            None,
+            false,
         )
         .await;
 

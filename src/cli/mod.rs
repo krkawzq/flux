@@ -1,17 +1,21 @@
 //! CLI command implementations.
 
 pub mod ssh_config;
+pub mod state;
 
 use crate::audit;
+use crate::cli::state::HostState;
 use crate::config::{Config, SecretValue};
 use crate::remote::ssh::{SshClient, SshConfig};
 use crate::remote::{RemoteOps, RetryPolicy};
 use crate::reporter::console::ConsoleReporter;
+use crate::reporter::multi_host::MultiHostConsoleReporter;
 use crate::reporter::{Reporter, Stage};
 use crate::sync::{Pipeline, PipelineFilter, PipelineOpts};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use dialoguer::{Confirm, Password};
+use futures::StreamExt;
 use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
@@ -35,6 +39,10 @@ pub struct SyncRunOptions {
     pub skip_stage: Vec<String>,
     pub only_item: Vec<String>,
     pub tag: Vec<String>,
+    pub hosts: Vec<String>,
+    pub no_cache: bool,
+    pub resume: bool,
+    pub max_hosts: usize,
 }
 
 pub fn init_tracing(format: LogFormat) {
@@ -80,48 +88,83 @@ pub async fn run_sync(
         ssh_config::save_ssh_config(&name, &config).context("saving ssh config")?;
     }
 
-    let ssh_config = resolve_ssh_config(&config)?;
-    let mut ssh = SshClient::connect(&ssh_config)
-        .await
-        .context("ssh connect")?;
-    if config.proxy.enabled && !opts.dry_run {
-        ssh.start_reverse_forward(config.proxy.local_port, config.proxy.remote_port)
-            .await
-            .context("starting reverse forward")?;
+    if opts.no_cache && opts.resume {
+        warn!("--resume used with --no-cache; resume state may be stale");
+    }
+    if opts.hosts.is_empty() {
+        let reporter = ConsoleReporter::new();
+        let summary = run_single_host(
+            &config,
+            &asset_root,
+            name_or_path,
+            build_pipeline_opts(&opts)?,
+            opts.resume,
+            &reporter,
+        )
+        .await?;
+        if summary.exit_code() != 0 {
+            std::process::exit(summary.exit_code());
+        }
+        return Ok(());
     }
 
+    let pipeline_opts = build_pipeline_opts(&opts)?;
+    let hosts = opts.hosts.clone();
+    let max_hosts = opts.max_hosts.min(hosts.len()).max(1);
+    let results: Vec<(String, Result<crate::reporter::PipelineSummary>)> =
+        futures::stream::iter(hosts.into_iter().map(|host| {
+            let mut host_config = config.clone();
+            host_config.host = Some(host.clone());
+            let asset_root = asset_root.clone();
+            let name = name_or_path.to_string();
+            let pipeline_opts = pipeline_opts.clone();
+            let resume = opts.resume;
+            async move {
+                let reporter = MultiHostConsoleReporter::new(host.clone());
+                let summary = run_single_host(
+                    &host_config,
+                    &asset_root,
+                    &name,
+                    pipeline_opts,
+                    resume,
+                    &reporter,
+                )
+                .await;
+                (host, summary)
+            }
+        }))
+        .buffer_unordered(max_hosts)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut any_failed = false;
     let reporter = ConsoleReporter::new();
-    let started = std::time::Instant::now();
-    let pipeline = Pipeline {
-        config: &config,
-        asset_root: &asset_root,
-        remote: &ssh,
-        reporter: &reporter,
-        opts: PipelineOpts {
-            dry_run: opts.dry_run,
-            diff: opts.diff,
-            max_concurrency: opts.max_concurrency.unwrap_or(8),
-            retry: RetryPolicy {
-                max_attempts: opts.retries.max(1),
-                base_backoff: std::time::Duration::from_millis(200),
-            },
-            script_timeout: opts.script_timeout.map(std::time::Duration::from_secs),
-            filter: build_pipeline_filter(&opts)?,
-        },
-    };
-    let summary = pipeline.run().await;
-    if let Err(err) = audit::append(
-        &ssh_config.host,
-        name_or_path,
-        started.elapsed().as_millis(),
-        &summary,
-    ) {
-        warn!("failed to append audit log: {err}");
+    let mut grand = std::collections::HashMap::new();
+    for (_host, result) in results {
+        match result {
+            Ok(summary) => {
+                any_failed |= summary.exit_code() != 0;
+                for stage in summary.stages {
+                    let entry = grand.entry(stage.stage).or_insert((0usize, 0usize, 0usize));
+                    entry.0 += stage.applied;
+                    entry.1 += stage.skipped;
+                    entry.2 += stage.failed;
+                }
+            }
+            Err(err) => {
+                any_failed = true;
+                reporter.warning(&format!("host run failed: {err}"));
+            }
+        }
     }
-    let code = summary.exit_code();
-    ssh.close().await.ok();
-    if code != 0 {
-        std::process::exit(code);
+    reporter.info("grand total:");
+    for (stage, (applied, skipped, failed)) in grand {
+        reporter.info(&format!(
+            "{stage:?}: applied={applied}, skipped={skipped}, failed={failed}"
+        ));
+    }
+    if any_failed {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -287,6 +330,99 @@ fn validate_sync_options(opts: &SyncRunOptions) -> Result<()> {
         anyhow::bail!("--diff requires --dry-run");
     }
     Ok(())
+}
+
+fn build_pipeline_opts(opts: &SyncRunOptions) -> Result<PipelineOpts> {
+    Ok(PipelineOpts {
+        dry_run: opts.dry_run,
+        diff: opts.diff,
+        max_concurrency: opts.max_concurrency.unwrap_or(8),
+        retry: RetryPolicy {
+            max_attempts: opts.retries.max(1),
+            base_backoff: std::time::Duration::from_millis(200),
+        },
+        script_timeout: opts.script_timeout.map(std::time::Duration::from_secs),
+        filter: build_pipeline_filter(opts)?,
+        state: None,
+        use_cache: !opts.no_cache,
+        resume_from: None,
+    })
+}
+
+async fn run_single_host(
+    config: &Config,
+    asset_root: &Path,
+    config_name: &str,
+    mut pipeline_opts: PipelineOpts,
+    resume: bool,
+    reporter: &dyn Reporter,
+) -> Result<crate::reporter::PipelineSummary> {
+    let ssh_config = resolve_ssh_config(config)?;
+    let state = state::load(&ssh_config.host);
+    if pipeline_opts.use_cache {
+        pipeline_opts.state = state.clone();
+    }
+    if resume {
+        pipeline_opts.resume_from = state
+            .as_ref()
+            .and_then(|state| state.last_failed_item.clone());
+    }
+    let mut ssh = SshClient::connect(&ssh_config)
+        .await
+        .context("ssh connect")?;
+    if config.proxy.enabled && !pipeline_opts.dry_run {
+        ssh.start_reverse_forward(config.proxy.local_port, config.proxy.remote_port)
+            .await
+            .context("starting reverse forward")?;
+    }
+    let started = std::time::Instant::now();
+    let pipeline = Pipeline {
+        config,
+        asset_root,
+        remote: &ssh,
+        reporter,
+        opts: pipeline_opts,
+    };
+    let (_plan, summary) = pipeline.run_with_plan().await;
+    save_host_state(config, asset_root, &ssh_config.host, &summary);
+    if let Err(err) = audit::append(
+        &ssh_config.host,
+        config_name,
+        started.elapsed().as_millis(),
+        &summary,
+    ) {
+        warn!("failed to append audit log: {err}");
+    }
+    ssh.close().await.ok();
+    Ok(summary)
+}
+
+fn save_host_state(
+    config: &Config,
+    asset_root: &Path,
+    host: &str,
+    summary: &crate::reporter::PipelineSummary,
+) {
+    let mut item_hashes = crate::sync::file::collect_item_hashes(&config.file);
+    item_hashes.extend(crate::sync::script::collect_item_hashes(
+        &config.script,
+        asset_root,
+        &config.interpreter,
+        config.flags.as_slice(),
+    ));
+    item_hashes.extend(crate::sync::block::collect_item_hashes(
+        &config.block,
+        asset_root,
+    ));
+    let state = HostState {
+        host: host.to_string(),
+        last_sync_ts: chrono::Utc::now().timestamp(),
+        item_hashes,
+        last_failed_item: summary.first_failed_item.clone(),
+    };
+    if let Err(err) = state::save(&state) {
+        warn!("failed to save state for {host}: {err}");
+    }
 }
 
 fn build_pipeline_filter(opts: &SyncRunOptions) -> Result<PipelineFilter> {

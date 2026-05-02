@@ -9,6 +9,7 @@ pub mod file;
 pub mod plan;
 pub mod script;
 
+use crate::cli::state::HostState;
 use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
 use crate::remote::RetryPolicy;
@@ -46,6 +47,9 @@ pub struct PipelineOpts {
     pub retry: RetryPolicy,
     pub script_timeout: Option<Duration>,
     pub filter: PipelineFilter,
+    pub state: Option<HostState>,
+    pub use_cache: bool,
+    pub resume_from: Option<String>,
 }
 
 impl Default for PipelineOpts {
@@ -57,6 +61,9 @@ impl Default for PipelineOpts {
             retry: RetryPolicy::default(),
             script_timeout: None,
             filter: PipelineFilter::default(),
+            state: None,
+            use_cache: true,
+            resume_from: None,
         }
     }
 }
@@ -93,6 +100,8 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             self.remote,
             self.opts.max_concurrency,
             self.opts.retry,
+            self.opts.state.as_ref(),
+            self.opts.use_cache,
         )
         .await;
         let script_actions = script::plan_scripts(
@@ -100,6 +109,8 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             self.asset_root,
             &self.config.interpreter,
             self.config.flags.as_slice(),
+            self.opts.state.as_ref(),
+            self.opts.use_cache,
         )
         .await;
         let block_actions = block::plan_blocks_with_concurrency(
@@ -109,6 +120,8 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             self.remote,
             self.opts.max_concurrency,
             self.opts.retry,
+            self.opts.state.as_ref(),
+            self.opts.use_cache,
         )
         .await;
         let mut plan = Plan {
@@ -117,25 +130,31 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             script_actions,
             block_actions,
         };
+        apply_resume(&mut plan, self.opts.resume_from.as_deref());
         apply_filter(&mut plan, &self.opts.filter, &self.item_tags());
         plan
     }
 
-    pub async fn run(&self) -> PipelineSummary {
+    pub async fn run_with_plan(&self) -> (Plan, PipelineSummary) {
         let plan = self.plan().await;
+        let initial_failed = first_failed_in_plan(&plan);
         if self.opts.dry_run {
             if self.opts.diff {
                 print_plan_with_diff(&plan, self.remote, self.reporter).await;
             } else {
                 self.reporter.print_plan(&plan);
             }
-            return PipelineSummary {
-                stages: vec![],
-                interrupted: false,
-                dry_run: true,
-            };
+            return (
+                plan,
+                PipelineSummary {
+                    stages: vec![],
+                    interrupted: false,
+                    dry_run: true,
+                    first_failed_item: initial_failed,
+                },
+            );
         }
-        tokio::select! {
+        let summary = tokio::select! {
             summary = self.execute(&plan) => summary,
             _ = tokio::signal::ctrl_c() => {
                 self.reporter.warning("interrupted by user (Ctrl-C)");
@@ -143,103 +162,163 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                     stages: vec![],
                     interrupted: true,
                     dry_run: false,
+                    first_failed_item: None,
                 }
             }
+        };
+        let mut summary = summary;
+        if summary.first_failed_item.is_none() {
+            summary.first_failed_item = initial_failed;
         }
+        (plan, summary)
+    }
+
+    pub async fn run(&self) -> PipelineSummary {
+        self.run_with_plan().await.1
     }
 
     pub async fn execute(&self, plan: &Plan) -> PipelineSummary {
         let mut stages = Vec::new();
+        let mut first_failed_item = None;
         if let Some(action) = &plan.register_pubkey {
-            stages.push(self.execute_pubkey(action).await);
+            let (summary, failed) = self.execute_pubkey(action).await;
+            first_failed_item = first_failed_item.or(failed);
+            stages.push(summary);
         }
-        stages.push(self.execute_file_stage(&plan.file_actions).await);
-        stages.push(self.execute_script_stage(&plan.script_actions).await);
-        stages.push(self.execute_block_stage(&plan.block_actions).await);
+        let (file_summary, file_failed) = self.execute_file_stage(&plan.file_actions).await;
+        first_failed_item = first_failed_item.or(file_failed);
+        stages.push(file_summary);
+        let (script_summary, script_failed) = self.execute_script_stage(&plan.script_actions).await;
+        first_failed_item = first_failed_item.or(script_failed);
+        stages.push(script_summary);
+        let (block_summary, block_failed) = self.execute_block_stage(&plan.block_actions).await;
+        first_failed_item = first_failed_item.or(block_failed);
+        stages.push(block_summary);
         let summary = PipelineSummary {
             stages,
             interrupted: false,
             dry_run: false,
+            first_failed_item,
         };
         self.reporter.pipeline_summary(&summary);
         summary
     }
 
-    async fn execute_file_stage(&self, actions: &[FileAction]) -> StageSummary {
+    async fn execute_file_stage(&self, actions: &[FileAction]) -> (StageSummary, Option<String>) {
         self.reporter.stage_started(Stage::File, actions.len());
-        let outcomes: Vec<ItemOutcome> = futures::stream::iter(actions.iter())
-            .map(|action| async move {
-                file::execute_file(action, self.remote, self.reporter, self.opts.retry).await
-            })
-            .buffer_unordered(self.opts.max_concurrency)
-            .collect()
-            .await;
-        let summary = tally(Stage::File, &outcomes);
+        let outcomes: Vec<(usize, String, ItemOutcome)> =
+            futures::stream::iter(actions.iter().enumerate())
+                .map(|(idx, action)| async move {
+                    (
+                        idx,
+                        file_item_name(action).to_string(),
+                        file::execute_file(action, self.remote, self.reporter, self.opts.retry)
+                            .await,
+                    )
+                })
+                .buffer_unordered(self.opts.max_concurrency)
+                .collect()
+                .await;
+        let mut ordered = outcomes;
+        ordered.sort_by_key(|(idx, _, _)| *idx);
+        let first_failed = ordered.iter().find_map(|(_, name, outcome)| {
+            matches!(outcome, ItemOutcome::Failed(_)).then(|| name.clone())
+        });
+        let summary = tally(
+            Stage::File,
+            &ordered
+                .iter()
+                .map(|(_, _, outcome)| outcome.clone())
+                .collect::<Vec<_>>(),
+        );
         self.reporter.stage_finished(&summary);
-        summary
+        (summary, first_failed)
     }
 
-    async fn execute_script_stage(&self, actions: &[ScriptAction]) -> StageSummary {
+    async fn execute_script_stage(
+        &self,
+        actions: &[ScriptAction],
+    ) -> (StageSummary, Option<String>) {
         self.reporter.stage_started(Stage::Script, actions.len());
         let mut outcomes = Vec::with_capacity(actions.len());
+        let mut first_failed = None;
         for action in actions {
-            outcomes.push(
-                script::execute_script(
-                    action,
-                    self.remote,
-                    self.reporter,
-                    self.opts.retry,
-                    self.opts.script_timeout,
-                )
-                .await,
-            );
+            let outcome = script::execute_script(
+                action,
+                self.remote,
+                self.reporter,
+                self.opts.retry,
+                self.opts.script_timeout,
+            )
+            .await;
+            if first_failed.is_none() && matches!(outcome, ItemOutcome::Failed(_)) {
+                first_failed = Some(script_item_name(action).to_string());
+            }
+            outcomes.push(outcome);
         }
         let summary = tally(Stage::Script, &outcomes);
         self.reporter.stage_finished(&summary);
-        summary
+        (summary, first_failed)
     }
 
-    async fn execute_block_stage(&self, actions: &[BlockAction]) -> StageSummary {
+    async fn execute_block_stage(&self, actions: &[BlockAction]) -> (StageSummary, Option<String>) {
         self.reporter.stage_started(Stage::Block, actions.len());
-        let mut by_target: HashMap<String, Vec<&BlockAction>> = HashMap::new();
-        for action in actions {
+        let mut by_target: HashMap<String, Vec<(usize, &BlockAction)>> = HashMap::new();
+        for (idx, action) in actions.iter().enumerate() {
             let key = match action {
                 BlockAction::Apply { target, .. } => target.clone(),
                 BlockAction::Skip { item_name, .. } | BlockAction::Failed { item_name, .. } => {
                     format!("_special:{item_name}")
                 }
             };
-            by_target.entry(key).or_default().push(action);
+            by_target.entry(key).or_default().push((idx, action));
         }
 
         let template = self.config.comment_template.clone();
-        let outcomes_groups: Vec<Vec<ItemOutcome>> = futures::stream::iter(by_target.into_values())
-            .map(|group| async {
-                let mut outcomes = Vec::with_capacity(group.len());
-                for action in group {
-                    outcomes.push(
-                        block::execute_block(
-                            action,
-                            self.remote,
-                            &template,
-                            self.reporter,
-                            self.opts.retry,
-                        )
-                        .await,
-                    );
-                }
-                outcomes
-            })
-            .buffer_unordered(self.opts.max_concurrency)
-            .collect()
-            .await;
-        let outcomes: Vec<ItemOutcome> = outcomes_groups.into_iter().flatten().collect();
-        let summary = tally(Stage::Block, &outcomes);
+        let outcomes_groups: Vec<Vec<(usize, String, ItemOutcome)>> =
+            futures::stream::iter(by_target.into_values())
+                .map(|group| async {
+                    let mut outcomes = Vec::with_capacity(group.len());
+                    for (idx, action) in group {
+                        outcomes.push((
+                            idx,
+                            block_item_name(action).to_string(),
+                            block::execute_block(
+                                action,
+                                self.remote,
+                                &template,
+                                self.reporter,
+                                self.opts.retry,
+                            )
+                            .await,
+                        ));
+                    }
+                    outcomes
+                })
+                .buffer_unordered(self.opts.max_concurrency)
+                .collect()
+                .await;
+        let mut ordered: Vec<(usize, String, ItemOutcome)> =
+            outcomes_groups.into_iter().flatten().collect();
+        ordered.sort_by_key(|(idx, _, _)| *idx);
+        let first_failed = ordered.iter().find_map(|(_, name, outcome)| {
+            matches!(outcome, ItemOutcome::Failed(_)).then(|| name.clone())
+        });
+        let summary = tally(
+            Stage::Block,
+            &ordered
+                .iter()
+                .map(|(_, _, outcome)| outcome.clone())
+                .collect::<Vec<_>>(),
+        );
         self.reporter.stage_finished(&summary);
-        summary
+        (summary, first_failed)
     }
 
-    async fn execute_pubkey(&self, action: &RegisterPubkeyAction) -> StageSummary {
+    async fn execute_pubkey(
+        &self,
+        action: &RegisterPubkeyAction,
+    ) -> (StageSummary, Option<String>) {
         self.reporter.stage_started(Stage::Pubkey, 1);
         let result = async {
             let pub_bytes = std::fs::read(&action.local_pubkey_path)
@@ -292,7 +371,9 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             .item_finished(Stage::Pubkey, "register_pubkey", &outcome);
         let summary = tally(Stage::Pubkey, std::slice::from_ref(&outcome));
         self.reporter.stage_finished(&summary);
-        summary
+        let failed =
+            matches!(outcome, ItemOutcome::Failed(_)).then(|| "register_pubkey".to_string());
+        (summary, failed)
     }
 
     fn item_tags(&self) -> HashMap<String, Vec<String>> {
@@ -378,6 +459,85 @@ fn apply_filter(
             };
         }
     }
+}
+
+fn apply_resume(plan: &mut Plan, resume_from: Option<&str>) {
+    let Some(target) = resume_from else {
+        return;
+    };
+    let mut reached = false;
+    if let Some(action) = &plan.register_pubkey {
+        if target == "register_pubkey" {
+            reached = true;
+        } else if !reached {
+            let _ = action;
+            plan.register_pubkey = None;
+        }
+    }
+    for action in &mut plan.file_actions {
+        resume_action_file(action, target, &mut reached);
+    }
+    for action in &mut plan.script_actions {
+        resume_action_script(action, target, &mut reached);
+    }
+    for action in &mut plan.block_actions {
+        resume_action_block(action, target, &mut reached);
+    }
+}
+
+fn resume_action_file(action: &mut FileAction, target: &str, reached: &mut bool) {
+    let name = file_item_name(action).to_string();
+    if !*reached && name != target {
+        *action = FileAction::Skip {
+            item_name: name,
+            reason: SkipReason::PreviouslyApplied,
+        };
+    } else if name == target {
+        *reached = true;
+    }
+}
+
+fn resume_action_script(action: &mut ScriptAction, target: &str, reached: &mut bool) {
+    let name = script_item_name(action).to_string();
+    if !*reached && name != target {
+        *action = ScriptAction::Skip {
+            item_name: name,
+            reason: SkipReason::PreviouslyApplied,
+        };
+    } else if name == target {
+        *reached = true;
+    }
+}
+
+fn resume_action_block(action: &mut BlockAction, target: &str, reached: &mut bool) {
+    let name = block_item_name(action).to_string();
+    if !*reached && name != target {
+        *action = BlockAction::Skip {
+            item_name: name,
+            reason: SkipReason::PreviouslyApplied,
+        };
+    } else if name == target {
+        *reached = true;
+    }
+}
+
+fn first_failed_in_plan(plan: &Plan) -> Option<String> {
+    for action in &plan.file_actions {
+        if matches!(action, FileAction::Failed { .. }) {
+            return Some(file_item_name(action).to_string());
+        }
+    }
+    for action in &plan.script_actions {
+        if matches!(action, ScriptAction::Failed { .. }) {
+            return Some(script_item_name(action).to_string());
+        }
+    }
+    for action in &plan.block_actions {
+        if matches!(action, BlockAction::Failed { .. }) {
+            return Some(block_item_name(action).to_string());
+        }
+    }
+    None
 }
 
 fn action_selected(
@@ -585,9 +745,12 @@ fn resolve_config_paths(mut config: Config, config_path: &Path) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::state::HostState;
     use crate::config::{FileItem, ItemKind, ProxyConfig, SyncMode};
     use crate::remote::fake::InMemoryRemote;
     use crate::reporter::memory::CapturedReporter;
+    use crate::reporter::multi_host::MultiHostConsoleReporter;
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     fn minimal_config(items: Vec<FileItem>) -> Config {
@@ -657,6 +820,9 @@ mod tests {
                 retry: RetryPolicy::default(),
                 script_timeout: None,
                 filter: PipelineFilter::default(),
+                state: None,
+                use_cache: true,
+                resume_from: None,
             },
         };
         let _ = pipe.run().await;
@@ -742,6 +908,7 @@ mod tests {
             stages: vec![],
             interrupted: true,
             dry_run: false,
+            first_failed_item: None,
         };
         assert_eq!(summary.exit_code(), 130);
     }
@@ -879,5 +1046,150 @@ mod tests {
         };
         let plan = pipe.plan().await;
         assert!(matches!(&plan.file_actions[0], FileAction::Apply { .. }));
+    }
+
+    #[tokio::test]
+    async fn cache_skip_avoids_remote_exists_calls() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
+            mode: SyncMode::Cover,
+            chmod: None,
+            tags: vec![],
+        }]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                state: Some(HostState {
+                    host: "h".into(),
+                    last_sync_ts: 0,
+                    item_hashes: crate::sync::file::collect_item_hashes(&config.file),
+                    last_failed_item: None,
+                }),
+                use_cache: true,
+                ..PipelineOpts::default()
+            },
+        };
+        let plan = pipe.plan().await;
+        assert!(matches!(
+            &plan.file_actions[0],
+            FileAction::Skip {
+                reason: SkipReason::ContentUnchanged,
+                ..
+            }
+        ));
+        assert_eq!(remote.exists_calls().len(), 0);
+        assert_eq!(remote.exec_calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_only_runs_target_and_after() {
+        let tmp = TempDir::new().unwrap();
+        let src1 = tmp.path().join("a");
+        let src2 = tmp.path().join("b");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let config = minimal_config(vec![
+            FileItem {
+                name: Some("first".into()),
+                src: src1.to_string_lossy().into_owned(),
+                dst: ":/r/a".into(),
+                kind: ItemKind::Auto,
+                target: None,
+                mode: SyncMode::Cover,
+                chmod: None,
+                tags: vec![],
+            },
+            FileItem {
+                name: Some("second".into()),
+                src: src2.to_string_lossy().into_owned(),
+                dst: ":/r/b".into(),
+                kind: ItemKind::Auto,
+                target: None,
+                mode: SyncMode::Cover,
+                chmod: None,
+                tags: vec![],
+            },
+        ]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                resume_from: Some("second".into()),
+                ..PipelineOpts::default()
+            },
+        };
+        let plan = pipe.plan().await;
+        assert!(matches!(
+            &plan.file_actions[0],
+            FileAction::Skip {
+                reason: SkipReason::PreviouslyApplied,
+                ..
+            }
+        ));
+        assert!(matches!(&plan.file_actions[1], FileAction::Apply { .. }));
+    }
+
+    #[tokio::test]
+    async fn multi_host_fanout_counts_summaries() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
+            mode: SyncMode::Cover,
+            chmod: None,
+            tags: vec![],
+        }]);
+        let results = futures::stream::iter(["h1", "h2", "h3"].into_iter().map(|host| {
+            let remote = InMemoryRemote::new();
+            let reporter = MultiHostConsoleReporter::new(host);
+            let config = config.clone();
+            let asset_root = tmp.path().to_path_buf();
+            async move {
+                let pipe = Pipeline {
+                    config: &config,
+                    asset_root: &asset_root,
+                    remote: &remote,
+                    reporter: &reporter,
+                    opts: PipelineOpts::default(),
+                };
+                pipe.run().await
+            }
+        }))
+        .buffer_unordered(3)
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|summary| summary
+                    .stages
+                    .iter()
+                    .map(|stage| stage.applied)
+                    .sum::<usize>())
+                .sum::<usize>(),
+            3
+        );
     }
 }

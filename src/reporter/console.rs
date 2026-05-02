@@ -216,6 +216,7 @@ fn skip_reason_label(reason: &SkipReason) -> String {
         SkipReason::RemoteNewer => "remote newer".into(),
         SkipReason::ContentUnchanged => "content unchanged".into(),
         SkipReason::FilteredOut => "filtered out".into(),
+        SkipReason::PreviouslyApplied => "previously applied".into(),
     }
 }
 
@@ -361,6 +362,7 @@ mod tests {
             SkipReason::RemoteNewer,
             SkipReason::ContentUnchanged,
             SkipReason::FilteredOut,
+            SkipReason::PreviouslyApplied,
         ] {
             let rendered = skip_reason_label(&reason);
             assert!(!rendered.is_empty());

@@ -1,5 +1,6 @@
 //! Script execution stage.
 
+use crate::cli::state::HostState;
 use crate::config::ScriptItem;
 use crate::remote::{with_retry, RemoteOps, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
@@ -7,6 +8,7 @@ use crate::sync::plan::ScriptAction;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashMap, path::Path as StdPath};
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ScriptError {
@@ -38,6 +40,8 @@ pub async fn plan_scripts(
     asset_root: &Path,
     default_interpreter: &str,
     default_flags: &[String],
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> Vec<ScriptAction> {
     let mut actions = Vec::with_capacity(items.len());
     for item in items {
@@ -46,6 +50,8 @@ pub async fn plan_scripts(
             asset_root,
             default_interpreter,
             default_flags,
+            state,
+            use_cache,
         ));
     }
     actions
@@ -56,6 +62,8 @@ fn plan_one_script(
     asset_root: &Path,
     default_interpreter: &str,
     default_flags: &[String],
+    state: Option<&HostState>,
+    use_cache: bool,
 ) -> ScriptAction {
     let item_name = item.path.clone();
 
@@ -91,6 +99,17 @@ fn plan_one_script(
     argv.extend(flags);
     argv.push(upload_to.clone());
     argv.extend(item.args.iter().cloned());
+    let hash = hash_script(&bytes, &argv);
+    if use_cache
+        && state
+            .and_then(|state| state.item_hashes.get(&item_name))
+            .is_some_and(|cached| cached == &hash)
+    {
+        return ScriptAction::Skip {
+            item_name,
+            reason: crate::sync::plan::SkipReason::ContentUnchanged,
+        };
+    }
 
     ScriptAction::Run {
         item_name,
@@ -98,6 +117,49 @@ fn plan_one_script(
         local_script_bytes: bytes,
         command_argv: argv,
     }
+}
+
+pub fn collect_item_hashes(
+    items: &[ScriptItem],
+    asset_root: &StdPath,
+    default_interpreter: &str,
+    default_flags: &[String],
+) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    for item in items {
+        let item_name = item.path.clone();
+        let local_path = resolve_script_path(asset_root, &item.path);
+        if let Ok(bytes) = std::fs::read(&local_path) {
+            let interpreter = item.interpreter.as_deref().unwrap_or(default_interpreter);
+            let flags = item
+                .flags
+                .clone()
+                .filter(|flags| !flags.is_empty())
+                .unwrap_or_else(|| default_flags.to_vec());
+            let mut argv = vec![interpreter.to_string()];
+            argv.extend(flags);
+            argv.push("/tmp/placeholder.sh".into());
+            argv.extend(item.args.iter().cloned());
+            hashes.insert(item_name, hash_script(&bytes, &argv));
+        }
+    }
+    hashes
+}
+
+fn hash_script(bytes: &[u8], argv: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.update([0]);
+    for arg in argv {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub async fn execute_script<R: RemoteOps + ?Sized>(
@@ -197,7 +259,15 @@ mod tests {
     async fn run_action_uploads_and_execs() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
-        let actions = plan_scripts(&[item("s", "s.sh")], tmp.path(), "/bin/bash", &[]).await;
+        let actions = plan_scripts(
+            &[item("s", "s.sh")],
+            tmp.path(),
+            "/bin/bash",
+            &[],
+            None,
+            false,
+        )
+        .await;
         let remote = InMemoryRemote::new();
         let reporter = CapturedReporter::new();
         let outcome = execute_script::<InMemoryRemote>(
@@ -223,7 +293,15 @@ mod tests {
     async fn run_action_passes_timeout_to_interactive_exec() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
-        let actions = plan_scripts(&[item("s", "s.sh")], tmp.path(), "/bin/bash", &[]).await;
+        let actions = plan_scripts(
+            &[item("s", "s.sh")],
+            tmp.path(),
+            "/bin/bash",
+            &[],
+            None,
+            false,
+        )
+        .await;
         let remote = InMemoryRemote::new();
         let reporter = CapturedReporter::new();
         let timeout = Duration::from_secs(3);

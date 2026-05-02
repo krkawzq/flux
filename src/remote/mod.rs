@@ -60,6 +60,7 @@ pub trait RemoteOps: Send + Sync {
     async fn mtime(&self, path: &str) -> Result<DateTime<Utc>, RemoteOpsError>;
     async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError>;
     async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError>;
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteOpsError>;
     async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError>;
     async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError>;
 

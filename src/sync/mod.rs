@@ -13,12 +13,15 @@ use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
 use crate::remote::RetryPolicy;
 use crate::remote::{with_retry, RemoteOps, RemoteOpsError};
+use crate::reporter::console::print_plan_with_diff;
 use crate::reporter::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
-use crate::sync::plan::{BlockAction, FileAction, Plan, RegisterPubkeyAction, ScriptAction};
+use crate::sync::plan::{
+    BlockAction, FileAction, Plan, RegisterPubkeyAction, ScriptAction, SkipReason,
+};
 use anyhow::Result;
 use dialoguer::{Input, Password};
 use futures::stream::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,20 +41,32 @@ pub enum SyncError {
 #[derive(Debug, Clone)]
 pub struct PipelineOpts {
     pub dry_run: bool,
+    pub diff: bool,
     pub max_concurrency: usize,
     pub retry: RetryPolicy,
     pub script_timeout: Option<Duration>,
+    pub filter: PipelineFilter,
 }
 
 impl Default for PipelineOpts {
     fn default() -> Self {
         Self {
             dry_run: false,
+            diff: false,
             max_concurrency: 8,
             retry: RetryPolicy::default(),
             script_timeout: None,
+            filter: PipelineFilter::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PipelineFilter {
+    pub only_stages: Option<HashSet<Stage>>,
+    pub skip_stages: HashSet<Stage>,
+    pub only_items: Option<HashSet<String>>,
+    pub tags: Option<HashSet<String>>,
 }
 
 pub struct Pipeline<'a, R: RemoteOps + ?Sized> {
@@ -96,18 +111,24 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             self.opts.retry,
         )
         .await;
-        Plan {
+        let mut plan = Plan {
             register_pubkey,
             file_actions,
             script_actions,
             block_actions,
-        }
+        };
+        apply_filter(&mut plan, &self.opts.filter, &self.item_tags());
+        plan
     }
 
     pub async fn run(&self) -> PipelineSummary {
         let plan = self.plan().await;
         if self.opts.dry_run {
-            self.reporter.print_plan(&plan);
+            if self.opts.diff {
+                print_plan_with_diff(&plan, self.remote, self.reporter).await;
+            } else {
+                self.reporter.print_plan(&plan);
+            }
             return PipelineSummary {
                 stages: vec![],
                 interrupted: false,
@@ -273,6 +294,21 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
         self.reporter.stage_finished(&summary);
         summary
     }
+
+    fn item_tags(&self) -> HashMap<String, Vec<String>> {
+        let mut tags = HashMap::new();
+        for item in &self.config.file {
+            let name = item.name.clone().unwrap_or_else(|| item.src.clone());
+            tags.insert(name, item.tags.clone());
+        }
+        for item in &self.config.script {
+            tags.insert(item.path.clone(), item.tags.clone());
+        }
+        for item in &self.config.block {
+            tags.insert(item.name.clone(), item.tags.clone());
+        }
+        tags
+    }
 }
 
 fn parse_pubkey_body(line: &str) -> Option<(String, String)> {
@@ -304,6 +340,104 @@ fn tally(stage: Stage, outcomes: &[ItemOutcome]) -> StageSummary {
         applied,
         skipped,
         failed,
+    }
+}
+
+fn apply_filter(
+    plan: &mut Plan,
+    filter: &PipelineFilter,
+    item_tags: &HashMap<String, Vec<String>>,
+) {
+    if !stage_selected(filter, Stage::Pubkey) {
+        plan.register_pubkey = None;
+    }
+    for action in &mut plan.file_actions {
+        let name = file_item_name(action).to_string();
+        if !action_selected(filter, Stage::File, &name, item_tags) {
+            *action = FileAction::Skip {
+                item_name: name,
+                reason: SkipReason::FilteredOut,
+            };
+        }
+    }
+    for action in &mut plan.script_actions {
+        let name = script_item_name(action).to_string();
+        if !action_selected(filter, Stage::Script, &name, item_tags) {
+            *action = ScriptAction::Skip {
+                item_name: name,
+                reason: SkipReason::FilteredOut,
+            };
+        }
+    }
+    for action in &mut plan.block_actions {
+        let name = block_item_name(action).to_string();
+        if !action_selected(filter, Stage::Block, &name, item_tags) {
+            *action = BlockAction::Skip {
+                item_name: name,
+                reason: SkipReason::FilteredOut,
+            };
+        }
+    }
+}
+
+fn action_selected(
+    filter: &PipelineFilter,
+    stage: Stage,
+    item_name: &str,
+    item_tags: &HashMap<String, Vec<String>>,
+) -> bool {
+    if !stage_selected(filter, stage) {
+        return false;
+    }
+    if let Some(only_items) = &filter.only_items {
+        if !only_items.contains(item_name) {
+            return false;
+        }
+    }
+    if let Some(tags) = &filter.tags {
+        let matched = item_tags
+            .get(item_name)
+            .into_iter()
+            .flatten()
+            .any(|tag| tags.contains(tag));
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn stage_selected(filter: &PipelineFilter, stage: Stage) -> bool {
+    if filter.skip_stages.contains(&stage) {
+        return false;
+    }
+    filter
+        .only_stages
+        .as_ref()
+        .is_none_or(|stages| stages.contains(&stage))
+}
+
+fn file_item_name(action: &FileAction) -> &str {
+    match action {
+        FileAction::Skip { item_name, .. }
+        | FileAction::Apply { item_name, .. }
+        | FileAction::Failed { item_name, .. } => item_name,
+    }
+}
+
+fn script_item_name(action: &ScriptAction) -> &str {
+    match action {
+        ScriptAction::Skip { item_name, .. }
+        | ScriptAction::Run { item_name, .. }
+        | ScriptAction::Failed { item_name, .. } => item_name,
+    }
+}
+
+fn block_item_name(action: &BlockAction) -> &str {
+    match action {
+        BlockAction::Skip { item_name, .. }
+        | BlockAction::Apply { item_name, .. }
+        | BlockAction::Failed { item_name, .. } => item_name,
     }
 }
 
@@ -495,6 +629,7 @@ mod tests {
             dst: ":/r/a".into(),
             mode: SyncMode::Cover,
             chmod: None,
+            tags: vec![],
         }]);
         let remote = InMemoryRemote::new();
         let reporter = CapturedReporter::new();
@@ -505,9 +640,11 @@ mod tests {
             reporter: &reporter,
             opts: PipelineOpts {
                 dry_run: true,
+                diff: false,
                 max_concurrency: 4,
                 retry: RetryPolicy::default(),
                 script_timeout: None,
+                filter: PipelineFilter::default(),
             },
         };
         let _ = pipe.run().await;
@@ -526,6 +663,7 @@ mod tests {
                 dst: ":/r/x".into(),
                 mode: SyncMode::Cover,
                 chmod: None,
+                tags: vec![],
             },
             FileItem {
                 name: Some("good".into()),
@@ -533,6 +671,7 @@ mod tests {
                 dst: ":/r/y".into(),
                 mode: SyncMode::Cover,
                 chmod: None,
+                tags: vec![],
             },
         ]);
         let remote = InMemoryRemote::new();
@@ -589,5 +728,132 @@ mod tests {
             dry_run: false,
         };
         assert_eq!(summary.exit_code(), 130);
+    }
+
+    #[tokio::test]
+    async fn skip_stage_marks_all_as_filtered_out() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            mode: SyncMode::Cover,
+            chmod: None,
+            tags: vec!["dotfiles".into()],
+        }]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                filter: PipelineFilter {
+                    only_stages: None,
+                    skip_stages: HashSet::from([Stage::File]),
+                    only_items: None,
+                    tags: None,
+                },
+                ..PipelineOpts::default()
+            },
+        };
+        let plan = pipe.plan().await;
+        assert!(matches!(
+            &plan.file_actions[0],
+            FileAction::Skip {
+                reason: SkipReason::FilteredOut,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_item_keeps_only_named() {
+        let tmp = TempDir::new().unwrap();
+        let src1 = tmp.path().join("a");
+        let src2 = tmp.path().join("b");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let config = minimal_config(vec![
+            FileItem {
+                name: Some("keep".into()),
+                src: src1.to_string_lossy().into_owned(),
+                dst: ":/r/a".into(),
+                mode: SyncMode::Cover,
+                chmod: None,
+                tags: vec![],
+            },
+            FileItem {
+                name: Some("drop".into()),
+                src: src2.to_string_lossy().into_owned(),
+                dst: ":/r/b".into(),
+                mode: SyncMode::Cover,
+                chmod: None,
+                tags: vec![],
+            },
+        ]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                filter: PipelineFilter {
+                    only_stages: None,
+                    skip_stages: HashSet::new(),
+                    only_items: Some(HashSet::from([String::from("keep")])),
+                    tags: None,
+                },
+                ..PipelineOpts::default()
+            },
+        };
+        let plan = pipe.plan().await;
+        assert!(matches!(&plan.file_actions[0], FileAction::Apply { .. }));
+        assert!(matches!(
+            &plan.file_actions[1],
+            FileAction::Skip {
+                reason: SkipReason::FilteredOut,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tag_filter_intersects() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            mode: SyncMode::Cover,
+            chmod: None,
+            tags: vec!["dotfiles".into()],
+        }]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                filter: PipelineFilter {
+                    only_stages: None,
+                    skip_stages: HashSet::new(),
+                    only_items: None,
+                    tags: Some(HashSet::from([String::from("dotfiles")])),
+                },
+                ..PipelineOpts::default()
+            },
+        };
+        let plan = pipe.plan().await;
+        assert!(matches!(&plan.file_actions[0], FileAction::Apply { .. }));
     }
 }

@@ -96,6 +96,12 @@ impl InMemoryRemote {
         self.inner.lock().unwrap().modes.get(path).copied()
     }
 
+    pub fn file_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.inner.lock().unwrap().files.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
     fn take_failure(guard: &mut Inner, op: &'static str) -> Option<RemoteOpsError> {
         let failures = guard.transient_failures.get_mut(op)?;
         if failures.is_empty() {
@@ -206,6 +212,27 @@ impl RemoteOps for InMemoryRemote {
         Ok(())
     }
 
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteOpsError> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "rename") {
+            return Err(err);
+        }
+        let bytes = guard
+            .files
+            .remove(from)
+            .ok_or_else(|| RemoteOpsError::NotFound(from.to_string()))?;
+        let mtime = guard.mtimes.remove(from).unwrap_or_else(Utc::now);
+        let mode = guard.modes.remove(from);
+        guard.files.insert(to.to_string(), bytes);
+        guard.mtimes.insert(to.to_string(), mtime);
+        if let Some(mode) = mode {
+            guard.modes.insert(to.to_string(), mode);
+        } else {
+            guard.modes.remove(to);
+        }
+        Ok(())
+    }
+
     async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
         if let Some(err) = Self::take_failure(&mut guard, "remove_file") {
@@ -303,6 +330,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_moves_contents_and_mode() {
+        let remote = InMemoryRemote::new();
+        remote.write_file("/a", b"x").await.unwrap();
+        remote.chmod("/a", 0o600).await.unwrap();
+        remote.rename("/a", "/b").await.unwrap();
+        assert_eq!(remote.file_contents("/a"), None);
+        assert_eq!(remote.file_contents("/b"), Some(b"x".to_vec()));
+        assert_eq!(remote.file_mode("/b"), Some(0o600));
+    }
+
+    #[tokio::test]
     async fn exec_rules_match() {
         let remote = InMemoryRemote::new();
         remote.add_exec_rule(ExecRule {
@@ -315,7 +353,7 @@ mod tests {
         assert_eq!(out.stdout_string(), "hi\n");
         let out2 = remote.exec("ls /").await.unwrap();
         assert_eq!(out2.status, 0);
-        assert_eq!(out2.stdout, vec![]);
+        assert_eq!(out2.stdout, Vec::<u8>::new());
         assert_eq!(
             remote.exec_calls(),
             vec!["echo hi".to_string(), "ls /".to_string()]

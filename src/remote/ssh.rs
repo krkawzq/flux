@@ -7,6 +7,7 @@ use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use console::Term;
 use futures::future::pending;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKey};
 use russh::{client, Channel, ChannelMsg, Disconnect, Sig};
@@ -313,6 +314,7 @@ impl SshClient {
 
     /// Execute command with stdin/stdout streaming (with PTY)
     pub async fn exec_interactive(&self, command: &str, timeout: Option<Duration>) -> Result<i32> {
+        let (rows, cols) = Term::stdout().size_checked().unwrap_or((24, 80));
         let mut channel = self
             .session
             .channel_open_session()
@@ -320,7 +322,7 @@ impl SshClient {
             .context("Failed to open SSH channel")?;
 
         channel
-            .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+            .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
             .await
             .context("Failed to request PTY")?;
 
@@ -344,7 +346,78 @@ impl SshClient {
                 pending::<()>().await;
             }
         });
+        #[cfg(unix)]
+        {
+            let mut winch =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
+            loop {
+                tokio::select! {
+                    read = stdin.read(&mut stdin_buf), if !stdin_closed => {
+                        match read {
+                            Ok(0) => {
+                                stdin_closed = true;
+                                channel.eof().await.ok();
+                            }
+                            Ok(n) => {
+                                channel
+                                    .data(&stdin_buf[..n])
+                                    .await
+                                    .context("Failed to forward stdin to remote PTY")?;
+                            }
+                            Err(err) => return Err(err).context("Failed to read local stdin"),
+                        }
+                    }
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                stdout.write_all(&data).await?;
+                                stdout.flush().await?;
+                            }
+                            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                                stderr.write_all(&data).await?;
+                                stderr.flush().await?;
+                            }
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                exit_code = Some(exit_status as i32);
+                                break;
+                            }
+                            Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => break,
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        let now = Instant::now();
+                        let second_press = first_ctrl_c
+                            .map(|first| now.duration_since(first) <= Duration::from_secs(5))
+                            .unwrap_or(false);
+                        if second_press {
+                            channel.close().await.ok();
+                        } else {
+                            channel.signal(Sig::INT).await.ok();
+                            first_ctrl_c = Some(now);
+                        }
+                    }
+                    _ = &mut timeout_fut => {
+                        channel.close().await.ok();
+                        let duration = timeout_label.expect("timeout future only resolves when timeout is set");
+                        return Err(anyhow::anyhow!("interactive_exec timed out after {duration:?}"));
+                    }
+                    _ = async {
+                        match &mut winch {
+                            Some(signal) => {
+                                signal.recv().await;
+                            }
+                            None => pending::<()>().await,
+                        }
+                    } => {
+                        let (rows, cols) = Term::stdout().size_checked().unwrap_or((24, 80));
+                        channel.window_change(cols as u32, rows as u32, 0, 0).await.ok();
+                    }
+                }
+            }
+        }
 
+        #[cfg(not(unix))]
         loop {
             tokio::select! {
                 read = stdin.read(&mut stdin_buf), if !stdin_closed => {
@@ -645,6 +718,24 @@ impl RemoteOps for SshClient {
         self.chmod_remote(path, &format!("{mode:o}"))
             .await
             .map_err(map_anyhow)
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteOpsError> {
+        let out = self
+            .exec_command(&format!(
+                "mv -f {} {}",
+                shell_escape(from),
+                shell_escape(to)
+            ))
+            .await
+            .map_err(map_anyhow)?;
+        if out.exit_code != 0 {
+            return Err(RemoteOpsError::NonZeroExit {
+                status: out.exit_code as i32,
+                stderr: out.stderr,
+            });
+        }
+        Ok(())
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {

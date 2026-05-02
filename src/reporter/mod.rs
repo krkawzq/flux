@@ -8,7 +8,7 @@ use crate::sync::plan::{Plan, SkipReason};
 use crate::sync::SyncError;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     File,
     Script,

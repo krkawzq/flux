@@ -513,6 +513,7 @@ mod tests {
             file: ":/remote/.bashrc".into(),
             mode: SyncMode::Sync,
             comment_template: None,
+            tags: vec![],
         };
 
         let actions1 = plan_blocks_with_concurrency(

@@ -18,12 +18,31 @@ enum Commands {
         save: Option<String>,
         #[arg(long, help = "Compute the plan and print it without applying changes")]
         dry_run: bool,
+        #[arg(long, help = "Show unified diffs for apply actions during dry-run")]
+        diff: bool,
+        #[arg(long, value_enum, default_value = "text")]
+        log_format: flux::cli::LogFormat,
         #[arg(long, value_name = "N")]
         max_concurrency: Option<usize>,
         #[arg(long, default_value = "3")]
         retries: u8,
         #[arg(long, value_name = "SECS")]
         script_timeout: Option<u64>,
+        #[arg(long, value_delimiter = ',')]
+        only_stage: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        skip_stage: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        only_item: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        tag: Vec<String>,
+    },
+    Undo {
+        config: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, value_enum, default_value = "text")]
+        log_format: flux::cli::LogFormat,
     },
     Proxy {
         host: String,
@@ -47,20 +66,39 @@ async fn main() -> anyhow::Result<()> {
             config,
             save,
             dry_run,
+            diff,
+            log_format,
             max_concurrency,
             retries,
             script_timeout,
+            only_stage,
+            skip_stage,
+            only_item,
+            tag,
         } => {
             flux::cli::run_sync(
                 &config,
                 save,
-                dry_run,
-                max_concurrency,
-                retries,
-                script_timeout,
+                flux::cli::SyncRunOptions {
+                    dry_run,
+                    diff,
+                    log_format,
+                    max_concurrency,
+                    retries,
+                    script_timeout,
+                    only_stage,
+                    skip_stage,
+                    only_item,
+                    tag,
+                },
             )
             .await
         }
+        Commands::Undo {
+            config,
+            yes,
+            log_format,
+        } => flux::cli::run_undo(&config, yes, log_format).await,
         Commands::Proxy {
             host,
             local,

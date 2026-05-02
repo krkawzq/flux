@@ -1,8 +1,10 @@
 //! Default reporter: write to stdout/stderr with `console` styling.
 
 use super::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
+use crate::remote::{RemoteOps, RemoteOpsError};
 use crate::sync::plan::{BlockAction, FileAction, Plan, ScriptAction, SkipReason};
 use console::{style, Term};
+use similar::TextDiff;
 use std::sync::Mutex;
 
 pub struct ConsoleReporter {
@@ -29,6 +31,65 @@ impl ConsoleReporter {
 impl Default for ConsoleReporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub async fn print_plan_with_diff<R: RemoteOps + ?Sized>(
+    plan: &Plan,
+    remote: &R,
+    reporter: &dyn Reporter,
+) {
+    let term = Term::stdout();
+    let _ = term.write_line(
+        &style("DRY RUN - computed plan with diff:")
+            .bold()
+            .to_string(),
+    );
+    for action in &plan.file_actions {
+        print_file_action_line(&term, action);
+        if let FileAction::Apply { src, dst, .. } = action {
+            let local = match std::fs::read_to_string(src) {
+                Ok(text) => text,
+                Err(err) => {
+                    reporter.warning(&format!("failed to read {} for diff: {err}", src.display()));
+                    continue;
+                }
+            };
+            let remote_text = match remote.read_file(dst).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(RemoteOpsError::NotFound(_)) => String::new(),
+                Err(err) => {
+                    reporter.warning(&format!("failed to read remote {dst} for diff: {err}"));
+                    continue;
+                }
+            };
+            print_unified_diff(&term, dst, &remote_text, &local);
+        }
+    }
+    for action in &plan.script_actions {
+        print_script_action_line(&term, action);
+    }
+    for action in &plan.block_actions {
+        print_block_action_line(&term, action);
+        if let BlockAction::Apply {
+            target,
+            body,
+            sentinel,
+            ..
+        } = action
+        {
+            let remote_text = match remote.read_file(target).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(RemoteOpsError::NotFound(_)) => String::new(),
+                Err(err) => {
+                    reporter.warning(&format!("failed to read remote {target} for diff: {err}"));
+                    continue;
+                }
+            };
+            let existing_body =
+                extract_existing_block_body(&remote_text, &sentinel.name).unwrap_or_default();
+            print_unified_diff(&term, target, &existing_body, body);
+        }
     }
 }
 
@@ -76,19 +137,16 @@ impl Reporter for ConsoleReporter {
     }
 
     fn print_plan(&self, plan: &Plan) {
-        let _ = self
-            .out
-            .lock()
-            .unwrap()
-            .write_line(&style("DRY RUN - computed plan:").bold().to_string());
+        let out = self.out.lock().unwrap();
+        let _ = out.write_line(&style("DRY RUN - computed plan:").bold().to_string());
         for action in &plan.file_actions {
-            print_file_action(self, action);
+            print_file_action_line(&out, action);
         }
         for action in &plan.script_actions {
-            print_script_action(self, action);
+            print_script_action_line(&out, action);
         }
         for action in &plan.block_actions {
-            print_block_action(self, action);
+            print_block_action_line(&out, action);
         }
     }
 
@@ -136,11 +194,11 @@ fn skip_reason_label(reason: &SkipReason) -> String {
         SkipReason::AlreadyExists => "already exists".into(),
         SkipReason::RemoteNewer => "remote newer".into(),
         SkipReason::ContentUnchanged => "content unchanged".into(),
+        SkipReason::FilteredOut => "filtered out".into(),
     }
 }
 
-fn print_file_action(reporter: &ConsoleReporter, action: &FileAction) {
-    let out = reporter.out.lock().unwrap();
+fn print_file_action_line(out: &Term, action: &FileAction) {
     let _ = match action {
         FileAction::Skip { item_name, reason } => out.write_line(&format!(
             "  [file] ⊘ skip   {item_name} ({})",
@@ -164,8 +222,7 @@ fn print_file_action(reporter: &ConsoleReporter, action: &FileAction) {
     };
 }
 
-fn print_script_action(reporter: &ConsoleReporter, action: &ScriptAction) {
-    let out = reporter.out.lock().unwrap();
+fn print_script_action_line(out: &Term, action: &ScriptAction) {
     let _ = match action {
         ScriptAction::Skip { item_name, reason } => out.write_line(&format!(
             "  [script] ⊘ skip   {item_name} ({})",
@@ -180,8 +237,7 @@ fn print_script_action(reporter: &ConsoleReporter, action: &ScriptAction) {
     };
 }
 
-fn print_block_action(reporter: &ConsoleReporter, action: &BlockAction) {
-    let out = reporter.out.lock().unwrap();
+fn print_block_action_line(out: &Term, action: &BlockAction) {
     let _ = match action {
         BlockAction::Skip { item_name, reason } => out.write_line(&format!(
             "  [block] ⊘ skip   {item_name} ({})",
@@ -196,9 +252,51 @@ fn print_block_action(reporter: &ConsoleReporter, action: &BlockAction) {
     };
 }
 
+fn print_unified_diff(out: &Term, label: &str, old: &str, new: &str) {
+    let diff = TextDiff::from_lines(old, new);
+    for line in diff
+        .unified_diff()
+        .context_radius(3)
+        .header(label, label)
+        .to_string()
+        .lines()
+    {
+        let rendered = if line.starts_with('+') && !line.starts_with("+++") {
+            style(line).green().to_string()
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            style(line).red().to_string()
+        } else if line.starts_with("@@") {
+            style(line).cyan().to_string()
+        } else {
+            line.to_string()
+        };
+        let _ = out.write_line(&format!("    {rendered}"));
+    }
+}
+
+fn extract_existing_block_body(content: &str, name: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut body = String::new();
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if !in_block {
+            if trimmed.contains(&format!(">>> {name}:")) && trimmed.ends_with(" >>>") {
+                in_block = true;
+            }
+            continue;
+        }
+        if trimmed.contains(&format!("<<< {name}:")) && trimmed.ends_with(" <<<") {
+            return Some(body);
+        }
+        body.push_str(line);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::fake::InMemoryRemote;
     use crate::sync::plan::Plan;
 
     #[test]
@@ -213,9 +311,32 @@ mod tests {
             SkipReason::AlreadyExists,
             SkipReason::RemoteNewer,
             SkipReason::ContentUnchanged,
+            SkipReason::FilteredOut,
         ] {
             let rendered = skip_reason_label(&reason);
             assert!(!rendered.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn diff_prints_changed_file_lines() {
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old\n".to_vec())]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "new\n").unwrap();
+        let plan = Plan {
+            register_pubkey: None,
+            file_actions: vec![FileAction::Apply {
+                item_name: "a".into(),
+                src: path,
+                dst: "/r/a.txt".into(),
+                len: 4,
+                chmod: None,
+            }],
+            script_actions: vec![],
+            block_actions: vec![],
+        };
+        let reporter = ConsoleReporter::new();
+        print_plan_with_diff(&plan, &remote, &reporter).await;
     }
 }

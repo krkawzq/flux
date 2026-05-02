@@ -182,6 +182,7 @@ mod tests {
             args: vec![],
             interpreter: None,
             flags: None,
+            tags: vec![],
         }
     }
 

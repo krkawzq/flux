@@ -132,6 +132,8 @@ pub struct FileItem {
     pub mode: SyncMode,
     /// File permission (e.g., "755")
     pub chmod: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Script execution item
@@ -147,6 +149,8 @@ pub struct ScriptItem {
     /// Script arguments
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Block sync item
@@ -164,6 +168,8 @@ pub struct BlockItem {
     pub mode: SyncMode,
     /// Custom comment template
     pub comment_template: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Sync mode for file and block

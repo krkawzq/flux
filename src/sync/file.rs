@@ -5,6 +5,7 @@ use crate::path::FluxPath;
 use crate::remote::{with_retry, RemoteOps, RemoteOpsError, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{FileAction, SkipReason};
+use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
@@ -238,16 +239,35 @@ pub async fn execute_file<R: RemoteOps + ?Sized>(
                     return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
                 }
             };
-            if let Err(err) = with_retry(policy, || remote.write_file(dst, &bytes)).await {
+            let tmp = format!("{dst}.flux.tmp.{}", std::process::id());
+            if let Err(err) = with_retry(policy, || remote.write_file(&tmp, &bytes)).await {
                 return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
             }
             if let Some(mode) = chmod {
-                let current_mode = with_retry(policy, || remote.stat_mode(dst)).await.ok();
+                let current_mode = with_retry(policy, || remote.stat_mode(&tmp)).await.ok();
                 if current_mode != Some(*mode) {
-                    if let Err(err) = with_retry(policy, || remote.chmod(dst, *mode)).await {
+                    if let Err(err) = with_retry(policy, || remote.chmod(&tmp, *mode)).await {
                         return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
                     }
                 }
+            }
+            match with_retry(policy, || remote.exists(dst)).await {
+                Ok(true) => {
+                    let backup = format!("{dst}.flux-{}.bak", Utc::now().timestamp());
+                    if let Err(err) = with_retry(policy, || remote.rename(dst, &backup)).await {
+                        return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
+                    }
+                    if let Err(err) = rotate_backups(remote, dst, 3, policy).await {
+                        reporter.warning(&format!("failed to rotate backups for {dst}: {err}"));
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
+                }
+            }
+            if let Err(err) = with_retry(policy, || remote.rename(&tmp, dst)).await {
+                return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
             }
             ItemOutcome::Applied
         }
@@ -281,6 +301,50 @@ fn parent_dir(path: &str) -> Option<&str> {
     })
 }
 
+async fn rotate_backups<R: RemoteOps + ?Sized>(
+    remote: &R,
+    dst: &str,
+    keep: usize,
+    policy: RetryPolicy,
+) -> Result<(), RemoteOpsError> {
+    let quoted_dst = shell_escape(dst);
+    let pattern = format!("\"$(dirname {quoted_dst})/$(basename {quoted_dst})\".flux-*.bak");
+    let command = format!(
+        "ls -1 {pattern} 2>/dev/null | sort -t- -k2,2nr | tail -n +{}",
+        keep + 1
+    );
+    let out = with_retry(policy, || remote.exec(&command)).await?;
+    if !out.success() {
+        return Err(RemoteOpsError::NonZeroExit {
+            status: out.status,
+            stderr: out.stderr_string(),
+        });
+    }
+    for backup in out
+        .stdout_string()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        with_retry(policy, || remote.remove_file(backup)).await?;
+    }
+    Ok(())
+}
+
+fn shell_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('\'');
+    for ch in input.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +365,7 @@ mod tests {
             dst: dst.into(),
             mode,
             chmod: None,
+            tags: vec![],
         }
     }
 
@@ -415,6 +480,53 @@ mod tests {
         let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
         assert!(matches!(outcome, ItemOutcome::Applied));
         assert_eq!(remote.file_mode("/r/a.txt"), Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn execute_apply_creates_backup_when_dst_existed() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"new");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        remote.add_exec_rule(crate::remote::fake::ExecRule {
+            matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
+            status: 0,
+            stdout: vec![],
+            stderr: vec![],
+        });
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Cover)], &remote).await;
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
+        assert!(matches!(outcome, ItemOutcome::Applied));
+        assert_eq!(remote.file_contents("/r/a.txt"), Some(b"new".to_vec()));
+        assert!(remote
+            .file_paths()
+            .iter()
+            .any(|path| path.starts_with("/r/a.txt.flux-") && path.ends_with(".bak")));
+    }
+
+    #[tokio::test]
+    async fn rotate_keeps_latest_3_backups() {
+        let remote = InMemoryRemote::new();
+        remote.add_exec_rule(crate::remote::fake::ExecRule {
+            matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
+            status: 0,
+            stdout: b"/r/a.txt.flux-2.bak\n/r/a.txt.flux-1.bak\n".to_vec(),
+            stderr: vec![],
+        });
+        for ts in 1..=5 {
+            remote
+                .write_file(&format!("/r/a.txt.flux-{ts}.bak"), b"x")
+                .await
+                .unwrap();
+        }
+        rotate_backups(&remote, "/r/a.txt", 3, RetryPolicy::no_retry())
+            .await
+            .unwrap();
+        assert!(remote.file_contents("/r/a.txt.flux-1.bak").is_none());
+        assert!(remote.file_contents("/r/a.txt.flux-2.bak").is_none());
+        assert!(remote.file_contents("/r/a.txt.flux-3.bak").is_some());
+        assert!(remote.file_contents("/r/a.txt.flux-4.bak").is_some());
+        assert!(remote.file_contents("/r/a.txt.flux-5.bak").is_some());
     }
 
     #[tokio::test]

@@ -39,6 +39,9 @@ serde_json = "1"
 similar = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+dotenvy = "0.15"
+globset = "0.4"
+walkdir = "2"
 
 # Cross-platform
 [target.'cfg(unix)'.dependencies]

@@ -64,6 +64,27 @@ pub async fn print_plan_with_diff<R: RemoteOps + ?Sized>(
                 }
             };
             print_unified_diff(&term, dst, &remote_text, &local);
+        } else if let FileAction::ApplyDir { files, dst_dir, .. } = action {
+            for (src, relative_dst) in files {
+                let local = match std::fs::read_to_string(src) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        reporter
+                            .warning(&format!("failed to read {} for diff: {err}", src.display()));
+                        continue;
+                    }
+                };
+                let dst = join_remote_path(dst_dir, relative_dst);
+                let remote_text = match remote.read_file(&dst).await {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(RemoteOpsError::NotFound(_)) => String::new(),
+                    Err(err) => {
+                        reporter.warning(&format!("failed to read remote {dst} for diff: {err}"));
+                        continue;
+                    }
+                };
+                print_unified_diff(&term, &dst, &remote_text, &local);
+            }
         }
     }
     for action in &plan.script_actions {
@@ -216,10 +237,38 @@ fn print_file_action_line(out: &Term, action: &FileAction) {
                 .map(|mode| format!(" chmod={mode:o}"))
                 .unwrap_or_default()
         )),
+        FileAction::ApplyDir {
+            item_name,
+            dst_dir,
+            files,
+            chmod,
+            ..
+        } => out.write_line(&format!(
+            "  [file] ✓ apply  {item_name} -> {dst_dir} (dir, {} files){}",
+            files.len(),
+            chmod
+                .map(|mode| format!(" chmod={mode:o}"))
+                .unwrap_or_default()
+        )),
+        FileAction::ApplyLink {
+            item_name,
+            dst,
+            target,
+        } => out.write_line(&format!(
+            "  [file] ✓ apply  {item_name} -> {dst} (link -> {target})"
+        )),
         FileAction::Failed { item_name, error } => {
             out.write_line(&format!("  [file] ✗ fail   {item_name} ({error})"))
         }
     };
+}
+
+fn join_remote_path(base: &str, relative: &str) -> String {
+    if base == "/" {
+        format!("/{relative}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), relative)
+    }
 }
 
 fn print_script_action_line(out: &Term, action: &ScriptAction) {

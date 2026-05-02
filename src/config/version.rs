@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 struct VersionProbe {

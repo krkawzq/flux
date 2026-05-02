@@ -223,6 +223,7 @@ mod tests {
     fn config(host: &str, user: Option<&str>) -> Config {
         Config {
             version: 1,
+            imports: vec![],
             host: Some(host.into()),
             port: Some(22),
             user: user.map(ToOwned::to_owned),

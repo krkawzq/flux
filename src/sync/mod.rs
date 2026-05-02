@@ -421,6 +421,8 @@ fn file_item_name(action: &FileAction) -> &str {
     match action {
         FileAction::Skip { item_name, .. }
         | FileAction::Apply { item_name, .. }
+        | FileAction::ApplyDir { item_name, .. }
+        | FileAction::ApplyLink { item_name, .. }
         | FileAction::Failed { item_name, .. } => item_name,
     }
 }
@@ -500,8 +502,15 @@ fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
     };
     let key_path = config.key.clone();
     let password = match &config.password {
-        Some(password) if !password.is_empty() => Some(password.clone()),
-        _ => {
+        Some(secret) => {
+            let resolved = secret.resolve()?;
+            if resolved.is_empty() {
+                None
+            } else {
+                Some(resolved)
+            }
+        }
+        None => {
             let need_password = key_path.as_ref().is_none_or(|key| {
                 let expanded = expand_tilde(key);
                 !std::path::Path::new(&expanded).exists()
@@ -576,7 +585,7 @@ fn resolve_config_paths(mut config: Config, config_path: &Path) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FileItem, ProxyConfig, SyncMode};
+    use crate::config::{FileItem, ItemKind, ProxyConfig, SyncMode};
     use crate::remote::fake::InMemoryRemote;
     use crate::reporter::memory::CapturedReporter;
     use tempfile::TempDir;
@@ -584,6 +593,7 @@ mod tests {
     fn minimal_config(items: Vec<FileItem>) -> Config {
         Config {
             version: 1,
+            imports: vec![],
             host: Some("127.0.0.1".into()),
             port: Some(22),
             user: Some("u".into()),
@@ -627,6 +637,8 @@ mod tests {
             name: Some("a".into()),
             src: src.to_string_lossy().into_owned(),
             dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
             mode: SyncMode::Cover,
             chmod: None,
             tags: vec![],
@@ -661,6 +673,8 @@ mod tests {
                 name: Some("missing".into()),
                 src: "/no/such".into(),
                 dst: ":/r/x".into(),
+                kind: ItemKind::Auto,
+                target: None,
                 mode: SyncMode::Cover,
                 chmod: None,
                 tags: vec![],
@@ -669,6 +683,8 @@ mod tests {
                 name: Some("good".into()),
                 src: good.to_string_lossy().into_owned(),
                 dst: ":/r/y".into(),
+                kind: ItemKind::Auto,
+                target: None,
                 mode: SyncMode::Cover,
                 chmod: None,
                 tags: vec![],
@@ -739,6 +755,8 @@ mod tests {
             name: Some("a".into()),
             src: src.to_string_lossy().into_owned(),
             dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
             mode: SyncMode::Cover,
             chmod: None,
             tags: vec!["dotfiles".into()],
@@ -782,6 +800,8 @@ mod tests {
                 name: Some("keep".into()),
                 src: src1.to_string_lossy().into_owned(),
                 dst: ":/r/a".into(),
+                kind: ItemKind::Auto,
+                target: None,
                 mode: SyncMode::Cover,
                 chmod: None,
                 tags: vec![],
@@ -790,6 +810,8 @@ mod tests {
                 name: Some("drop".into()),
                 src: src2.to_string_lossy().into_owned(),
                 dst: ":/r/b".into(),
+                kind: ItemKind::Auto,
+                target: None,
                 mode: SyncMode::Cover,
                 chmod: None,
                 tags: vec![],
@@ -832,6 +854,8 @@ mod tests {
             name: Some("a".into()),
             src: src.to_string_lossy().into_owned(),
             dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
             mode: SyncMode::Cover,
             chmod: None,
             tags: vec!["dotfiles".into()],

@@ -3,7 +3,7 @@
 pub mod ssh_config;
 
 use crate::audit;
-use crate::config::Config;
+use crate::config::{Config, SecretValue};
 use crate::remote::ssh::{SshClient, SshConfig};
 use crate::remote::{RemoteOps, RetryPolicy};
 use crate::reporter::console::ConsoleReporter;
@@ -387,20 +387,7 @@ fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
             .interact_text()?,
     };
     let key_path = config.key.clone();
-    let password = match &config.password {
-        Some(password) if !password.is_empty() => Some(password.clone()),
-        _ => {
-            let need_password = key_path.as_ref().is_none_or(|key| {
-                let expanded = expand_tilde(key);
-                !std::path::Path::new(&expanded).exists()
-            });
-            if need_password {
-                Some(Password::new().with_prompt("Password").interact()?)
-            } else {
-                None
-            }
-        }
-    };
+    let password = resolve_password(config.password.as_ref(), key_path.as_ref())?;
     Ok(SshConfig {
         host,
         port,
@@ -480,6 +467,28 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+fn resolve_password(
+    password: Option<&SecretValue>,
+    key_path: Option<&String>,
+) -> Result<Option<String>> {
+    let resolved = match password {
+        Some(secret) => Some(secret.resolve().context("resolving config password")?),
+        None => None,
+    };
+    if resolved.as_ref().is_some_and(|value| !value.is_empty()) {
+        return Ok(resolved);
+    }
+    let need_password = key_path.as_ref().is_none_or(|key| {
+        let expanded = expand_tilde(key);
+        !std::path::Path::new(&expanded).exists()
+    });
+    if need_password {
+        Ok(Some(Password::new().with_prompt("Password").interact()?))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

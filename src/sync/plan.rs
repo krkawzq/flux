@@ -35,6 +35,18 @@ pub enum FileAction {
         len: u64,
         chmod: Option<u32>,
     },
+    ApplyDir {
+        item_name: String,
+        src_dir: PathBuf,
+        dst_dir: String,
+        files: Vec<(PathBuf, String)>,
+        chmod: Option<u32>,
+    },
+    ApplyLink {
+        item_name: String,
+        dst: String,
+        target: String,
+    },
     Failed {
         item_name: String,
         error: SyncError,

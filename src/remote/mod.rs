@@ -11,7 +11,10 @@ pub mod ssh;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 pub use retry::{with_retry, RetryPolicy};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecOutput {
@@ -48,6 +51,38 @@ pub enum RemoteOpsError {
     Encoding(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SharedCancellation {
+    presses: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl SharedCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn press(&self) -> usize {
+        let next = self.presses.fetch_add(1, Ordering::SeqCst) + 1;
+        self.notify.notify_waiters();
+        next
+    }
+
+    pub fn presses(&self) -> usize {
+        self.presses.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_change(&self, last_seen: usize) -> usize {
+        loop {
+            let current = self.presses();
+            if current != last_seen {
+                return current;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
 #[async_trait]
 pub trait RemoteOps: Send + Sync {
     /// Run a non-interactive command. Always returns `ExecOutput`; non-zero
@@ -70,5 +105,6 @@ pub trait RemoteOps: Send + Sync {
         &self,
         cmd: &str,
         timeout: Option<Duration>,
+        cancellation: Option<&SharedCancellation>,
     ) -> Result<i32, RemoteOpsError>;
 }

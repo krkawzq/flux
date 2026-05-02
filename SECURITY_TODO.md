@@ -35,6 +35,6 @@ git log --all --full-history -- .flux/
 
 4. **未来防线**
    - 安装 secret 扫描钩子，例如 `gitleaks` 或 `trufflehog`
-   - 把真实配置只放在 `.flux/`
-   - 把可共享的结构、注释和默认值维护在 `.flux.example/`
+   - 真实配置只放在 `.flux/`（已被 `.gitignore`）
+   - 敏感字段优先用 env 插值（`${VAR}` + `.flux/.env`）或 `keychain:` 引用，避免明文落盘
    - 评估是否彻底移除基于密码的 SSH 登录

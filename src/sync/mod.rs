@@ -12,7 +12,7 @@ pub mod script;
 use crate::cli::state::HostState;
 use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
-use crate::remote::RetryPolicy;
+use crate::remote::{RetryPolicy, SharedCancellation};
 use crate::remote::{with_retry, RemoteOps, RemoteOpsError};
 use crate::reporter::console::print_plan_with_diff;
 use crate::reporter::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
@@ -50,6 +50,7 @@ pub struct PipelineOpts {
     pub state: Option<HostState>,
     pub use_cache: bool,
     pub resume_from: Option<String>,
+    pub cancellation: Option<SharedCancellation>,
 }
 
 impl Default for PipelineOpts {
@@ -64,6 +65,7 @@ impl Default for PipelineOpts {
             state: None,
             use_cache: true,
             resume_from: None,
+            cancellation: None,
         }
     }
 }
@@ -154,19 +156,23 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 },
             );
         }
-        let summary = tokio::select! {
-            summary = self.execute(&plan) => summary,
-            _ = tokio::signal::ctrl_c() => {
-                self.reporter.warning("interrupted by user (Ctrl-C)");
-                PipelineSummary {
-                    stages: vec![],
-                    interrupted: true,
-                    dry_run: false,
-                    first_failed_item: None,
-                }
+        let cancellation = self
+            .opts
+            .cancellation
+            .clone()
+            .unwrap_or_else(SharedCancellation::new);
+        let listener_state = cancellation.clone();
+        let signal_task = tokio::spawn(async move {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                listener_state.press();
             }
-        };
-        let mut summary = summary;
+        });
+        let mut summary = self.execute(&plan, &cancellation).await;
+        signal_task.abort();
+        if cancellation.presses() > 0 {
+            self.reporter.warning("interrupted by user (Ctrl-C)");
+            summary.interrupted = true;
+        }
         if summary.first_failed_item.is_none() {
             summary.first_failed_item = initial_failed;
         }
@@ -177,20 +183,31 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
         self.run_with_plan().await.1
     }
 
-    pub async fn execute(&self, plan: &Plan) -> PipelineSummary {
+    pub async fn execute(&self, plan: &Plan, cancellation: &SharedCancellation) -> PipelineSummary {
         let mut stages = Vec::new();
         let mut first_failed_item = None;
         if let Some(action) = &plan.register_pubkey {
             let (summary, failed) = self.execute_pubkey(action).await;
             first_failed_item = first_failed_item.or(failed);
             stages.push(summary);
+            if cancellation.presses() > 0 {
+                return self.finish_interrupted(stages, first_failed_item);
+            }
         }
         let (file_summary, file_failed) = self.execute_file_stage(&plan.file_actions).await;
         first_failed_item = first_failed_item.or(file_failed);
         stages.push(file_summary);
-        let (script_summary, script_failed) = self.execute_script_stage(&plan.script_actions).await;
+        if cancellation.presses() > 0 {
+            return self.finish_interrupted(stages, first_failed_item);
+        }
+        let (script_summary, script_failed) = self
+            .execute_script_stage(&plan.script_actions, cancellation)
+            .await;
         first_failed_item = first_failed_item.or(script_failed);
         stages.push(script_summary);
+        if cancellation.presses() > 0 {
+            return self.finish_interrupted(stages, first_failed_item);
+        }
         let (block_summary, block_failed) = self.execute_block_stage(&plan.block_actions).await;
         first_failed_item = first_failed_item.or(block_failed);
         stages.push(block_summary);
@@ -238,17 +255,22 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
     async fn execute_script_stage(
         &self,
         actions: &[ScriptAction],
+        cancellation: &SharedCancellation,
     ) -> (StageSummary, Option<String>) {
         self.reporter.stage_started(Stage::Script, actions.len());
         let mut outcomes = Vec::with_capacity(actions.len());
         let mut first_failed = None;
         for action in actions {
+            if cancellation.presses() > 0 {
+                break;
+            }
             let outcome = script::execute_script(
                 action,
                 self.remote,
                 self.reporter,
                 self.opts.retry,
                 self.opts.script_timeout,
+                Some(cancellation),
             )
             .await;
             if first_failed.is_none() && matches!(outcome, ItemOutcome::Failed(_)) {
@@ -259,6 +281,21 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
         let summary = tally(Stage::Script, &outcomes);
         self.reporter.stage_finished(&summary);
         (summary, first_failed)
+    }
+
+    fn finish_interrupted(
+        &self,
+        stages: Vec<StageSummary>,
+        first_failed_item: Option<String>,
+    ) -> PipelineSummary {
+        let summary = PipelineSummary {
+            stages,
+            interrupted: true,
+            dry_run: false,
+            first_failed_item,
+        };
+        self.reporter.pipeline_summary(&summary);
+        summary
     }
 
     async fn execute_block_stage(&self, actions: &[BlockAction]) -> (StageSummary, Option<String>) {
@@ -823,6 +860,7 @@ mod tests {
                 state: None,
                 use_cache: true,
                 resume_from: None,
+                cancellation: None,
             },
         };
         let _ = pipe.run().await;
@@ -1191,5 +1229,50 @@ mod tests {
                 .sum::<usize>(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn first_ctrl_c_does_not_interrupt_pipeline_until_second_press() {
+        let tmp = Box::leak(Box::new(TempDir::new().unwrap()));
+        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\nsleep 30").unwrap();
+        let mut config = minimal_config(vec![]);
+        config.script.push(crate::config::ScriptItem {
+            path: "s.sh".into(),
+            interpreter: None,
+            flags: None,
+            args: vec![],
+            tags: vec![],
+        });
+        let config = Box::leak(Box::new(config));
+        let remote: &'static InMemoryRemote = Box::leak(Box::new(InMemoryRemote::new()));
+        remote.set_interactive_wait_for_cancellation(true);
+        let reporter: &'static CapturedReporter = Box::leak(Box::new(CapturedReporter::new()));
+        let cancellation = SharedCancellation::new();
+        let pipe = Pipeline {
+            config,
+            asset_root: tmp.path(),
+            remote,
+            reporter,
+            opts: PipelineOpts {
+                cancellation: Some(cancellation.clone()),
+                ..PipelineOpts::default()
+            },
+        };
+
+        let signal_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal_cancellation.press();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            signal_cancellation.press();
+        });
+        let task = pipe.run();
+        tokio::pin!(task);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task).await.is_err());
+        assert_eq!(remote.interactive_cancel_log(), vec![1]);
+
+        let summary = task.await;
+        assert!(summary.interrupted);
+        assert_eq!(remote.interactive_cancel_log(), vec![1, 2]);
     }
 }

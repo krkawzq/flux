@@ -2,7 +2,7 @@
 
 use crate::cli::state::HostState;
 use crate::config::ScriptItem;
-use crate::remote::{with_retry, RemoteOps, RetryPolicy};
+use crate::remote::{with_retry, RemoteOps, RetryPolicy, SharedCancellation};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::ScriptAction;
 use std::path::{Path, PathBuf};
@@ -95,15 +95,21 @@ fn plan_one_script(
         .clone()
         .filter(|flags| !flags.is_empty())
         .unwrap_or_else(|| default_flags.to_vec());
+    let cache_key = script_cache_key(
+        &item_name,
+        &bytes,
+        interpreter,
+        flags.as_slice(),
+        item.args.as_slice(),
+    );
     let mut argv = vec![interpreter.to_string()];
     argv.extend(flags);
     argv.push(upload_to.clone());
     argv.extend(item.args.iter().cloned());
-    let hash = hash_script(&bytes, &argv);
     if use_cache
         && state
             .and_then(|state| state.item_hashes.get(&item_name))
-            .is_some_and(|cached| cached == &hash)
+            .is_some_and(|cached| cached == &cache_key)
     {
         return ScriptAction::Skip {
             item_name,
@@ -136,22 +142,41 @@ pub fn collect_item_hashes(
                 .clone()
                 .filter(|flags| !flags.is_empty())
                 .unwrap_or_else(|| default_flags.to_vec());
-            let mut argv = vec![interpreter.to_string()];
-            argv.extend(flags);
-            argv.push("/tmp/placeholder.sh".into());
-            argv.extend(item.args.iter().cloned());
-            hashes.insert(item_name, hash_script(&bytes, &argv));
+            hashes.insert(
+                item_name.clone(),
+                script_cache_key(
+                    &item_name,
+                    &bytes,
+                    interpreter,
+                    flags.as_slice(),
+                    item.args.as_slice(),
+                ),
+            );
         }
     }
     hashes
 }
 
-fn hash_script(bytes: &[u8], argv: &[String]) -> String {
+fn script_cache_key(
+    item_name: &str,
+    bytes: &[u8],
+    interpreter: &str,
+    flags: &[String],
+    args: &[String],
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.update([0]);
-    for arg in argv {
+    hasher.update(item_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(interpreter.as_bytes());
+    hasher.update([0]);
+    for arg in flags {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    for arg in args {
         hasher.update(arg.as_bytes());
         hasher.update([0]);
     }
@@ -168,6 +193,7 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
     reporter: &dyn Reporter,
     policy: RetryPolicy,
     script_timeout: Option<Duration>,
+    cancellation: Option<&SharedCancellation>,
 ) -> ItemOutcome {
     let name = action_name(action);
     reporter.item_started(Stage::Script, &name);
@@ -193,7 +219,10 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
                 .map(|arg| shell_quote(arg))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let outcome = match remote.interactive_exec(&command, script_timeout).await {
+            let outcome = match remote
+                .interactive_exec(&command, script_timeout, cancellation)
+                .await
+            {
                 Ok(0) => ItemOutcome::Applied,
                 Ok(code) => ItemOutcome::Failed(Arc::new(ScriptError::ExitCode(code).into())),
                 Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
@@ -234,8 +263,10 @@ fn resolve_script_path(asset_root: &Path, path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::state::HostState;
     use crate::remote::fake::InMemoryRemote;
     use crate::reporter::memory::CapturedReporter;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn item(_name: &str, path: &str) -> ScriptItem {
@@ -276,6 +307,7 @@ mod tests {
             &reporter,
             RetryPolicy::no_retry(),
             None,
+            None,
         )
         .await;
         assert!(matches!(outcome, ItemOutcome::Applied));
@@ -311,6 +343,7 @@ mod tests {
             &reporter,
             RetryPolicy::no_retry(),
             Some(timeout),
+            None,
         )
         .await;
         assert_eq!(remote.interactive_calls()[0].1, Some(timeout));
@@ -326,5 +359,85 @@ mod tests {
             let decoded = inner.replace(r#"'\''"#, "'");
             assert_eq!(decoded, input);
         }
+    }
+
+    #[tokio::test]
+    async fn script_cache_hits_across_pids() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
+        let script = item("s", "s.sh");
+        let state = HostState {
+            host: "h".into(),
+            last_sync_ts: 0,
+            item_hashes: collect_item_hashes(
+                std::slice::from_ref(&script),
+                tmp.path(),
+                "/bin/bash",
+                &[],
+            )
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+            last_failed_item: None,
+        };
+        let actions = plan_scripts(
+            &[script],
+            tmp.path(),
+            "/bin/bash",
+            &[],
+            Some(&state),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            &actions[0],
+            ScriptAction::Skip {
+                reason: crate::sync::plan::SkipReason::ContentUnchanged,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_ctrl_c_waits_second_ctrl_c_closes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\nsleep 30").unwrap();
+        let actions = plan_scripts(
+            &[item("s", "s.sh")],
+            tmp.path(),
+            "/bin/bash",
+            &[],
+            None,
+            false,
+        )
+        .await;
+        let remote: &'static InMemoryRemote = Box::leak(Box::new(InMemoryRemote::new()));
+        remote.set_interactive_wait_for_cancellation(true);
+        let reporter: &'static CapturedReporter = Box::leak(Box::new(CapturedReporter::new()));
+        let cancellation = SharedCancellation::new();
+
+        let action = actions.into_iter().next().unwrap();
+        let signal_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal_cancellation.press();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            signal_cancellation.press();
+        });
+        let task = execute_script::<InMemoryRemote>(
+            &action,
+            remote,
+            reporter,
+            RetryPolicy::no_retry(),
+            None,
+            Some(&cancellation),
+        );
+        tokio::pin!(task);
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task).await.is_err());
+        assert_eq!(remote.interactive_cancel_log(), vec![1]);
+
+        let outcome = task.await;
+        assert!(matches!(outcome, ItemOutcome::Failed(_)));
+        assert_eq!(remote.interactive_cancel_log(), vec![1, 2]);
     }
 }

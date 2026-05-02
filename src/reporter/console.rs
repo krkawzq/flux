@@ -383,6 +383,7 @@ mod tests {
                 dst: "/r/a.txt".into(),
                 len: 4,
                 chmod: None,
+                observed_remote_mtime: None,
             }],
             script_actions: vec![],
             block_actions: vec![],

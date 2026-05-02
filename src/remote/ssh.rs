@@ -3,7 +3,7 @@
 //! Handles SSH connections, authentication, command execution, file transfer,
 //! and reverse port forwarding.
 
-use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError};
+use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError, SharedCancellation};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -313,7 +313,12 @@ impl SshClient {
     }
 
     /// Execute command with stdin/stdout streaming (with PTY)
-    pub async fn exec_interactive(&self, command: &str, timeout: Option<Duration>) -> Result<i32> {
+    pub async fn exec_interactive(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+        cancellation: Option<&SharedCancellation>,
+    ) -> Result<i32> {
         let (rows, cols) = Term::stdout().size_checked().unwrap_or((24, 80));
         let mut channel = self
             .session
@@ -338,6 +343,20 @@ impl SshClient {
         let mut stdin_closed = false;
         let mut exit_code = None;
         let mut first_ctrl_c = None::<Instant>;
+        let active_cancellation;
+        let signal_task = if let Some(cancellation) = cancellation {
+            active_cancellation = cancellation.clone();
+            None
+        } else {
+            active_cancellation = SharedCancellation::new();
+            let state = active_cancellation.clone();
+            Some(tokio::spawn(async move {
+                while tokio::signal::ctrl_c().await.is_ok() {
+                    state.press();
+                }
+            }))
+        };
+        let mut seen_presses = active_cancellation.presses();
         let timeout_label = timeout;
         let mut timeout_fut = Box::pin(async move {
             if let Some(duration) = timeout {
@@ -385,7 +404,8 @@ impl SshClient {
                             _ => {}
                         }
                     }
-                    _ = tokio::signal::ctrl_c() => {
+                    presses = active_cancellation.wait_for_change(seen_presses) => {
+                        seen_presses = presses;
                         let now = Instant::now();
                         let second_press = first_ctrl_c
                             .map(|first| now.duration_since(first) <= Duration::from_secs(5))
@@ -453,7 +473,8 @@ impl SshClient {
                         _ => {}
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                presses = active_cancellation.wait_for_change(seen_presses) => {
+                    seen_presses = presses;
                     let now = Instant::now();
                     let second_press = first_ctrl_c
                         .map(|first| now.duration_since(first) <= Duration::from_secs(5))
@@ -473,6 +494,9 @@ impl SshClient {
             }
         }
 
+        if let Some(task) = signal_task {
+            task.abort();
+        }
         channel.close().await.ok();
 
         Ok(exit_code.unwrap_or(0))
@@ -657,7 +681,17 @@ fn expand_tilde(path: &str) -> String {
 
 /// Escape shell special characters
 fn shell_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[async_trait]
@@ -771,8 +805,9 @@ impl RemoteOps for SshClient {
         &self,
         cmd: &str,
         timeout: Option<Duration>,
+        cancellation: Option<&SharedCancellation>,
     ) -> Result<i32, RemoteOpsError> {
-        self.exec_interactive(cmd, timeout)
+        self.exec_interactive(cmd, timeout, cancellation)
             .await
             .map_err(map_anyhow)
     }
@@ -780,4 +815,24 @@ impl RemoteOps for SshClient {
 
 fn map_anyhow(error: anyhow::Error) -> RemoteOpsError {
     RemoteOpsError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_escape;
+
+    #[test]
+    fn shell_escape_neutralizes_dollar_sign() {
+        assert_eq!(shell_escape("$HOME"), "'$HOME'");
+    }
+
+    #[test]
+    fn shell_escape_neutralizes_command_substitution() {
+        assert_eq!(shell_escape("$(rm -rf /)"), "'$(rm -rf /)'");
+    }
+
+    #[test]
+    fn shell_escape_handles_embedded_single_quote() {
+        assert_eq!(shell_escape("a'b"), r"'a'\''b'");
+    }
 }

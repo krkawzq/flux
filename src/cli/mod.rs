@@ -346,6 +346,7 @@ fn build_pipeline_opts(opts: &SyncRunOptions) -> Result<PipelineOpts> {
         state: None,
         use_cache: !opts.no_cache,
         resume_from: None,
+        cancellation: None,
     })
 }
 
@@ -403,6 +404,9 @@ fn save_host_state(
     host: &str,
     summary: &crate::reporter::PipelineSummary,
 ) {
+    if summary.dry_run || summary.interrupted || summary.total_failed() > 0 {
+        return;
+    }
     let mut item_hashes = crate::sync::file::collect_item_hashes(&config.file);
     item_hashes.extend(crate::sync::script::collect_item_hashes(
         &config.script,
@@ -413,6 +417,7 @@ fn save_host_state(
     item_hashes.extend(crate::sync::block::collect_item_hashes(
         &config.block,
         asset_root,
+        &config.comment_template,
     ));
     let state = HostState {
         host: host.to_string(),
@@ -630,6 +635,16 @@ fn resolve_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::state::{load, HostState};
+    use crate::reporter::{PipelineSummary, StageSummary};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    fn state_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn backup_timestamp_extracts_numeric_suffix() {
@@ -649,5 +664,57 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("--only-stage and --skip-stage"));
+    }
+
+    #[test]
+    fn dry_run_does_not_write_state() {
+        let _guard = state_env_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::env::set_var("FLUX_STATE_DIR", dir.path());
+        let config: Config = serde_yml::from_str("host: example\n").unwrap();
+        let summary = PipelineSummary {
+            stages: vec![],
+            interrupted: false,
+            dry_run: true,
+            first_failed_item: None,
+        };
+
+        save_host_state(&config, dir.path(), "example", &summary);
+
+        assert_eq!(load("example"), None);
+    }
+
+    #[test]
+    fn failed_run_does_not_write_state() {
+        let _guard = state_env_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::env::set_var("FLUX_STATE_DIR", dir.path());
+        let existing = HostState {
+            host: "example".into(),
+            last_sync_ts: 123,
+            item_hashes: HashMap::from([(String::from("a"), String::from("hash"))]),
+            last_failed_item: Some("old".into()),
+        };
+        std::fs::write(
+            dir.path().join("example.json"),
+            serde_json::to_vec_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+        let config: Config = serde_yml::from_str("host: example\n").unwrap();
+        let summary = PipelineSummary {
+            stages: vec![StageSummary {
+                stage: crate::reporter::Stage::File,
+                applied: 0,
+                skipped: 0,
+                failed: 1,
+            }],
+            interrupted: false,
+            dry_run: false,
+            first_failed_item: Some("new".into()),
+        };
+
+        save_host_state(&config, dir.path(), "example", &summary);
+
+        assert_eq!(load("example"), Some(existing));
     }
 }

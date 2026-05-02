@@ -1,6 +1,6 @@
 //! In-memory `RemoteOps` for tests.
 
-use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError};
+use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError, SharedCancellation};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,9 @@ struct Inner {
     exec_calls: Vec<String>,
     exists_calls: Vec<String>,
     interactive_calls: Vec<(String, Option<StdDuration>)>,
+    interactive_cancel_log: Vec<usize>,
     interactive_exit_status: i32,
+    interactive_wait_for_cancellation: bool,
     write_calls: Vec<(String, Vec<u8>)>,
     transient_failures: HashMap<&'static str, Vec<RemoteOpsError>>,
 }
@@ -67,6 +69,10 @@ impl InMemoryRemote {
         self.inner.lock().unwrap().interactive_exit_status = status;
     }
 
+    pub fn set_interactive_wait_for_cancellation(&self, enabled: bool) {
+        self.inner.lock().unwrap().interactive_wait_for_cancellation = enabled;
+    }
+
     pub fn fail_next(&self, op: &'static str, err: RemoteOpsError) {
         self.inner
             .lock()
@@ -91,6 +97,10 @@ impl InMemoryRemote {
 
     pub fn interactive_calls(&self) -> Vec<(String, Option<StdDuration>)> {
         self.inner.lock().unwrap().interactive_calls.clone()
+    }
+
+    pub fn interactive_cancel_log(&self) -> Vec<usize> {
+        self.inner.lock().unwrap().interactive_cancel_log.clone()
     }
 
     pub fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
@@ -263,13 +273,33 @@ impl RemoteOps for InMemoryRemote {
         &self,
         cmd: &str,
         timeout: Option<StdDuration>,
+        cancellation: Option<&SharedCancellation>,
     ) -> Result<i32, RemoteOpsError> {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(err) = Self::take_failure(&mut guard, "interactive_exec") {
-            return Err(err);
+        let (wait_for_cancellation, exit_status) = {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(err) = Self::take_failure(&mut guard, "interactive_exec") {
+                return Err(err);
+            }
+            guard.interactive_calls.push((cmd.to_string(), timeout));
+            (
+                guard.interactive_wait_for_cancellation,
+                guard.interactive_exit_status,
+            )
+        };
+        if wait_for_cancellation {
+            let cancellation = cancellation
+                .ok_or_else(|| RemoteOpsError::Transport("missing cancellation state".into()))?;
+            let mut seen = cancellation.presses();
+            loop {
+                seen = cancellation.wait_for_change(seen).await;
+                let mut guard = self.inner.lock().unwrap();
+                guard.interactive_cancel_log.push(seen);
+                if seen >= 2 {
+                    return Err(RemoteOpsError::Transport("interactive exec cancelled".into()));
+                }
+            }
         }
-        guard.interactive_calls.push((cmd.to_string(), timeout));
-        Ok(guard.interactive_exit_status)
+        Ok(exit_status)
     }
 }
 

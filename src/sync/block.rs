@@ -175,18 +175,6 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
             };
         }
     };
-    let local_hash = hash_string(&local_body);
-    if use_cache
-        && state
-            .and_then(|state| state.item_hashes.get(&item_name))
-            .is_some_and(|cached| cached == &local_hash)
-    {
-        return BlockAction::Skip {
-            item_name,
-            reason: SkipReason::ContentUnchanged,
-        };
-    }
-
     let target = match FluxPath::parse(&item.file) {
         FluxPath::Remote(path) => path,
         FluxPath::Local(_) => {
@@ -197,6 +185,18 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
             };
         }
     };
+    let chosen_template = item.comment_template.as_deref().unwrap_or(template);
+    let local_hash = block_cache_key(&item_name, &local_body, &target, &item.mode, chosen_template);
+    if use_cache
+        && state
+            .and_then(|state| state.item_hashes.get(&item_name))
+            .is_some_and(|cached| cached == &local_hash)
+    {
+        return BlockAction::Skip {
+            item_name,
+            reason: SkipReason::ContentUnchanged,
+        };
+    }
 
     let exists_remote = match with_retry(policy, || remote.exists(&target)).await {
         Ok(exists) => exists,
@@ -211,7 +211,6 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
         .and_then(|m| m.modified())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).timestamp())
         .unwrap_or_else(|_| chrono::Utc::now().timestamp());
-    let chosen_template = item.comment_template.as_deref().unwrap_or(template);
     let (open_marker, close_marker) = match build_markers(chosen_template, &item_name, timestamp) {
         Ok(markers) => markers,
         Err(err) => {
@@ -234,6 +233,7 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
             target,
             body: local_body,
             sentinel,
+            observed_remote_mtime: None,
         };
     }
 
@@ -287,14 +287,16 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
                     target,
                     body: local_body,
                     sentinel,
+                    observed_remote_mtime: remote_mtime,
                 }
             }
         }
         _ => BlockAction::Apply {
             item_name,
-            target,
+            target: target.clone(),
             body: local_body,
             sentinel,
+            observed_remote_mtime: with_retry(policy, || remote.mtime(&target)).await.ok(),
         },
     }
 }
@@ -317,22 +319,53 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn hash_string(value: &str) -> String {
-    hash(value.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-pub fn collect_item_hashes(items: &[BlockItem], asset_root: &Path) -> HashMap<String, String> {
+pub fn collect_item_hashes(
+    items: &[BlockItem],
+    asset_root: &Path,
+    template: &str,
+) -> HashMap<String, String> {
     let mut hashes = HashMap::new();
     for item in items {
         let local_path = resolve_block_path(asset_root, &item.path);
         if let Ok(body) = std::fs::read_to_string(local_path) {
-            hashes.insert(item.name.clone(), hash_string(&body));
+            if let FluxPath::Remote(target) = FluxPath::parse(&item.file) {
+                let chosen_template = item.comment_template.as_deref().unwrap_or(template);
+                hashes.insert(
+                    item.name.clone(),
+                    block_cache_key(&item.name, &body, &target, &item.mode, chosen_template),
+                );
+            }
         }
     }
     hashes
+}
+
+fn block_cache_key(
+    item_name: &str,
+    body: &str,
+    target: &str,
+    mode: &SyncMode,
+    comment_template: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher.update([0]);
+    hasher.update(target.as_bytes());
+    hasher.update([0]);
+    hasher.update(match mode {
+        SyncMode::Cover => b"cover".as_slice(),
+        SyncMode::Sync => b"sync".as_slice(),
+        SyncMode::Touch => b"touch".as_slice(),
+    });
+    hasher.update([0]);
+    hasher.update(comment_template.as_bytes());
+    hasher.update([0]);
+    hasher.update(item_name.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub async fn execute_block<R: RemoteOps + ?Sized>(
@@ -351,8 +384,13 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
             target,
             body,
             sentinel,
+            observed_remote_mtime,
             ..
         } => {
+            if remote_changed_since_plan(remote, target, *observed_remote_mtime, policy).await {
+                reporter.warning(&format!("skipping {target}: remote changed after planning"));
+                return finish_block(reporter, &name, ItemOutcome::Skipped(SkipReason::RemoteNewer));
+            }
             let current = match with_retry(policy, || remote.exists(target)).await {
                 Ok(true) => match with_retry(policy, || remote.read_file(target)).await {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -392,6 +430,19 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
 fn finish_block(reporter: &dyn Reporter, name: &str, outcome: ItemOutcome) -> ItemOutcome {
     reporter.item_finished(Stage::Block, name, &outcome);
     outcome
+}
+
+async fn remote_changed_since_plan<R: RemoteOps + ?Sized>(
+    remote: &R,
+    path: &str,
+    observed_remote_mtime: Option<DateTime<Utc>>,
+    policy: RetryPolicy,
+) -> bool {
+    match with_retry(policy, || remote.mtime(path)).await {
+        Ok(current) => observed_remote_mtime.is_none_or(|observed| current > observed),
+        Err(crate::remote::RemoteOpsError::NotFound(_)) => false,
+        Err(_) => false,
+    }
 }
 
 fn compose(
@@ -446,8 +497,10 @@ fn action_name(action: &BlockAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::state::HostState;
     use crate::config::{BlockItem, SyncMode};
     use crate::remote::fake::InMemoryRemote;
+    use std::collections::HashMap;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -587,5 +640,81 @@ mod tests {
             _ => panic!("expected apply"),
         };
         assert_eq!(ts1, ts2);
+    }
+
+    #[tokio::test]
+    async fn changing_block_target_invalidates_block_cache() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("aliases.sh"), b"alias x='1'\n").unwrap();
+        let old_item = BlockItem {
+            name: "aliases".into(),
+            path: "aliases.sh".into(),
+            file: ":/remote/.bashrc".into(),
+            mode: SyncMode::Sync,
+            comment_template: None,
+            tags: vec![],
+        };
+        let new_item = BlockItem {
+            file: ":/remote/.zshrc".into(),
+            ..old_item.clone()
+        };
+        let state = HostState {
+            host: "h".into(),
+            last_sync_ts: 0,
+            item_hashes: collect_item_hashes(&[old_item], tmp.path(), "# {}")
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            last_failed_item: None,
+        };
+        let remote = InMemoryRemote::new();
+        let actions = plan_blocks_with_concurrency(
+            &[new_item],
+            tmp.path(),
+            "# {}",
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+            Some(&state),
+            true,
+        )
+        .await;
+        assert!(matches!(&actions[0], BlockAction::Apply { target, .. } if target == "/remote/.zshrc"));
+    }
+
+    #[tokio::test]
+    async fn execute_block_skips_if_remote_changed_between_plan_and_execute() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("aliases.sh"), b"alias x='1'\n").unwrap();
+        let remote = InMemoryRemote::with_files([("/remote/.bashrc", b"old\n".to_vec())]);
+        let item = BlockItem {
+            name: "aliases".into(),
+            path: "aliases.sh".into(),
+            file: ":/remote/.bashrc".into(),
+            mode: SyncMode::Sync,
+            comment_template: None,
+            tags: vec![],
+        };
+        let actions = plan_blocks_with_concurrency(
+            &[item],
+            tmp.path(),
+            "# {}",
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+            None,
+            false,
+        )
+        .await;
+        remote.write_file("/remote/.bashrc", b"external\n").await.unwrap();
+        let reporter = crate::reporter::memory::CapturedReporter::new();
+        let outcome = execute_block(
+            &actions[0],
+            &remote,
+            "# {}",
+            &reporter,
+            RetryPolicy::no_retry(),
+        )
+        .await;
+        assert!(matches!(outcome, ItemOutcome::Skipped(SkipReason::RemoteNewer)));
     }
 }

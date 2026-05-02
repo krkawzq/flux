@@ -4,6 +4,7 @@
 //! mutate remote state; the `execute_*` companions consume them.
 
 use crate::sync::SyncError;
+use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub enum FileAction {
         dst: String,
         len: u64,
         chmod: Option<u32>,
+        observed_remote_mtime: Option<DateTime<Utc>>,
     },
     ApplyDir {
         item_name: String,
@@ -83,6 +85,7 @@ pub enum BlockAction {
         target: String,
         body: String,
         sentinel: Sentinel,
+        observed_remote_mtime: Option<DateTime<Utc>>,
     },
     Failed {
         item_name: String,

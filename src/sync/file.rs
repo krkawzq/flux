@@ -110,6 +110,7 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
     use_cache: bool,
 ) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
+    let mode = item.mode.clone();
     let chmod = item
         .chmod
         .as_deref()
@@ -117,7 +118,7 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
     match resolve_local_remote(&item.src, &item.dst) {
         Ok((local_path, remote_path)) => {
             if use_cache {
-                if let Some(hash) = hash_regular_file(&local_path) {
+                if let Some(hash) = regular_file_cache_key(&local_path, &remote_path, &mode, chmod) {
                     if state
                         .and_then(|state| state.item_hashes.get(&item_name))
                         .is_some_and(|cached| cached == &hash)
@@ -133,7 +134,7 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
                 item_name,
                 local_path,
                 remote_path,
-                item.mode.clone(),
+                mode,
                 chmod,
                 remote,
                 policy,
@@ -221,7 +222,7 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
         let dst = join_remote_path(&remote_base, &relative);
         let action_name = format!("{item_name}:{relative}");
         if use_cache {
-            if let Some(hash) = hash_regular_file(&path) {
+            if let Some(hash) = regular_file_cache_key(&path, &dst, &item.mode, chmod) {
                 if state
                     .and_then(|state| state.item_hashes.get(&action_name))
                     .is_some_and(|cached| cached == &hash)
@@ -260,6 +261,7 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
 
 fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
+    let mode = item.mode.clone();
     let chmod = item
         .chmod
         .as_deref()
@@ -315,7 +317,7 @@ fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> File
     }
 
     if use_cache {
-        let dir_hash = hash_dir_entries(&files);
+        let dir_hash = dir_cache_key(&files, &dst_dir, &mode, chmod);
         if state
             .and_then(|state| state.item_hashes.get(&item_name))
             .is_some_and(|cached| cached == &dir_hash)
@@ -358,7 +360,7 @@ fn plan_link(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> Fil
         };
     };
     if use_cache {
-        let link_hash = hash_link_target(&target);
+        let link_hash = link_cache_key(&dst, &target);
         if state
             .and_then(|state| state.item_hashes.get(&item_name))
             .is_some_and(|cached| cached == &link_hash)
@@ -382,8 +384,14 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
         match effective_kind(item) {
             ItemKind::File | ItemKind::Auto => {
                 let name = item.name.clone().unwrap_or_else(|| item.src.clone());
-                if let Ok((local_path, _)) = resolve_local_remote(&item.src, &item.dst) {
-                    if let Some(hash) = hash_regular_file(&local_path) {
+                if let Ok((local_path, remote_path)) = resolve_local_remote(&item.src, &item.dst) {
+                    let chmod = item
+                        .chmod
+                        .as_deref()
+                        .and_then(|value| u32::from_str_radix(value, 8).ok());
+                    if let Some(hash) =
+                        regular_file_cache_key(&local_path, &remote_path, &item.mode, chmod)
+                    {
                         hashes.insert(name, hash);
                     }
                 }
@@ -391,7 +399,8 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
             ItemKind::Glob => {
                 let name = item.name.clone().unwrap_or_else(|| item.src.clone());
                 let src = FluxPath::parse(&item.src);
-                if let FluxPath::Local(local_pattern) = src {
+                let dst = FluxPath::parse(&item.dst);
+                if let (FluxPath::Local(local_pattern), FluxPath::Remote(remote_base)) = (src, dst) {
                     if let Ok(glob) = Glob::new(&local_pattern.to_string_lossy()) {
                         let matcher = glob.compile_matcher();
                         let root = glob_search_root(&local_pattern);
@@ -413,7 +422,14 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
                                         .to_string_lossy()
                                         .into_owned()
                                 });
-                            if let Some(hash) = hash_regular_file(&path) {
+                            let dst = join_remote_path(&remote_base, &relative);
+                            let chmod = item
+                                .chmod
+                                .as_deref()
+                                .and_then(|value| u32::from_str_radix(value, 8).ok());
+                            if let Some(hash) =
+                                regular_file_cache_key(&path, &dst, &item.mode, chmod)
+                            {
                                 hashes.insert(format!("{name}:{relative}"), hash);
                             }
                         }
@@ -422,7 +438,7 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
             }
             ItemKind::Dir => {
                 let name = item.name.clone().unwrap_or_else(|| item.src.clone());
-                if let Ok((src_dir, _)) = resolve_local_remote(&item.src, &item.dst) {
+                if let Ok((src_dir, dst_dir)) = resolve_local_remote(&item.src, &item.dst) {
                     let files = WalkDir::new(&src_dir)
                         .into_iter()
                         .filter_map(Result::ok)
@@ -437,13 +453,19 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
                             (path, relative)
                         })
                         .collect::<Vec<_>>();
-                    hashes.insert(name, hash_dir_entries(&files));
+                    let chmod = item
+                        .chmod
+                        .as_deref()
+                        .and_then(|value| u32::from_str_radix(value, 8).ok());
+                    hashes.insert(name, dir_cache_key(&files, &dst_dir, &item.mode, chmod));
                 }
             }
             ItemKind::Link => {
                 let name = item.name.clone().unwrap_or_else(|| item.dst.clone());
                 if let Some(target) = &item.target {
-                    hashes.insert(name, hash_link_target(target));
+                    if let FluxPath::Remote(dst) = FluxPath::parse(&item.dst) {
+                        hashes.insert(name, link_cache_key(&dst, target));
+                    }
                 }
             }
         }
@@ -492,6 +514,11 @@ async fn plan_regular_file<R: RemoteOps + ?Sized>(
             };
         }
     };
+    let observed_remote_mtime = if exists_remote {
+        with_retry(policy, || remote.mtime(&remote_path)).await.ok()
+    } else {
+        None
+    };
 
     match mode {
         SyncMode::Touch if exists_remote => FileAction::Skip {
@@ -536,6 +563,7 @@ async fn plan_regular_file<R: RemoteOps + ?Sized>(
                             dst: remote_path,
                             len,
                             chmod,
+                            observed_remote_mtime,
                         },
                         Err(err) => FileAction::Failed {
                             item_name,
@@ -549,6 +577,7 @@ async fn plan_regular_file<R: RemoteOps + ?Sized>(
                     dst: remote_path,
                     len,
                     chmod,
+                    observed_remote_mtime,
                 },
                 Err(err) => FileAction::Failed {
                     item_name,
@@ -562,6 +591,7 @@ async fn plan_regular_file<R: RemoteOps + ?Sized>(
             dst: remote_path,
             len,
             chmod,
+            observed_remote_mtime,
         },
     }
 }
@@ -578,11 +608,22 @@ pub async fn execute_file<R: RemoteOps + ?Sized>(
         FileAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
         FileAction::Failed { error, .. } => ItemOutcome::Failed(Arc::new(error.clone())),
         FileAction::Apply {
-            src, dst, chmod, ..
-        } => match apply_file_path(remote, src, dst, *chmod, policy).await {
-            Ok(()) => ItemOutcome::Applied,
-            Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
-        },
+            src,
+            dst,
+            chmod,
+            observed_remote_mtime,
+            ..
+        } => {
+            if remote_changed_since_plan(remote, dst, *observed_remote_mtime, policy).await {
+                reporter.warning(&format!("skipping {dst}: remote changed after planning"));
+                ItemOutcome::Skipped(SkipReason::RemoteNewer)
+            } else {
+                match apply_file_path(remote, src, dst, *chmod, policy).await {
+                    Ok(()) => ItemOutcome::Applied,
+                    Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
+                }
+            }
+        }
         FileAction::ApplyDir {
             files,
             dst_dir,
@@ -639,6 +680,19 @@ async fn apply_file_path<R: RemoteOps + ?Sized>(
     }
     with_retry(policy, || remote.rename(&tmp, dst)).await?;
     Ok(())
+}
+
+async fn remote_changed_since_plan<R: RemoteOps + ?Sized>(
+    remote: &R,
+    path: &str,
+    observed_remote_mtime: Option<chrono::DateTime<chrono::Utc>>,
+    policy: RetryPolicy,
+) -> bool {
+    match with_retry(policy, || remote.mtime(path)).await {
+        Ok(current) => observed_remote_mtime.is_none_or(|observed| current > observed),
+        Err(RemoteOpsError::NotFound(_)) => false,
+        Err(_) => false,
+    }
 }
 
 async fn apply_link<R: RemoteOps + ?Sized>(
@@ -716,29 +770,53 @@ fn hash_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn hash_regular_file(path: &Path) -> Option<String> {
-    read_local_bytes(path).ok().map(|bytes| hash_hex(&bytes))
+fn update_cache_key(hasher: &mut Sha256, value: impl AsRef<[u8]>) {
+    hasher.update(value.as_ref());
+    hasher.update([0]);
 }
 
-fn hash_dir_entries(files: &[(PathBuf, String)]) -> String {
-    let mut hasher = Sha256::new();
-    for (path, relative) in files {
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        if let Ok(bytes) = std::fs::read(path) {
-            hasher.update(&bytes);
-        }
-        hasher.update([0]);
+fn mode_key(mode: &SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Cover => "cover",
+        SyncMode::Sync => "sync",
+        SyncMode::Touch => "touch",
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
-fn hash_link_target(target: &str) -> String {
-    hash_hex(target.as_bytes())
+fn regular_file_cache_key(
+    path: &Path,
+    dst: &str,
+    mode: &SyncMode,
+    chmod: Option<u32>,
+) -> Option<String> {
+    let bytes = read_local_bytes(path).ok()?;
+    let mut hasher = Sha256::new();
+    update_cache_key(&mut hasher, &bytes);
+    update_cache_key(&mut hasher, dst);
+    update_cache_key(&mut hasher, mode_key(mode));
+    update_cache_key(&mut hasher, chmod.map(|value| format!("{value:o}")).unwrap_or_default());
+    Some(hash_hex(&hasher.finalize()))
+}
+
+fn dir_cache_key(files: &[(PathBuf, String)], dst_dir: &str, mode: &SyncMode, chmod: Option<u32>) -> String {
+    let mut hasher = Sha256::new();
+    update_cache_key(&mut hasher, dst_dir);
+    update_cache_key(&mut hasher, mode_key(mode));
+    update_cache_key(&mut hasher, chmod.map(|value| format!("{value:o}")).unwrap_or_default());
+    for (path, relative) in files {
+        update_cache_key(&mut hasher, relative);
+        if let Ok(bytes) = std::fs::read(path) {
+            update_cache_key(&mut hasher, &bytes);
+        }
+    }
+    hash_hex(&hasher.finalize())
+}
+
+fn link_cache_key(dst: &str, target: &str) -> String {
+    let mut hasher = Sha256::new();
+    update_cache_key(&mut hasher, dst);
+    update_cache_key(&mut hasher, target);
+    hash_hex(&hasher.finalize())
 }
 
 fn parent_dir(path: &str) -> Option<&str> {
@@ -841,8 +919,10 @@ fn path_to_unix(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::state::HostState;
     use crate::remote::fake::InMemoryRemote;
     use crate::reporter::memory::CapturedReporter;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn local_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
@@ -1168,5 +1248,70 @@ mod tests {
         )
         .await;
         assert!(matches!(&actions[0], FileAction::Apply { .. }));
+    }
+
+    #[tokio::test]
+    async fn changing_dst_invalidates_file_cache() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let old_item = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        let mut new_item = item("a", &src, ":/r/b.txt", SyncMode::Cover);
+        new_item.name = Some("a".into());
+        let state = HostState {
+            host: "h".into(),
+            last_sync_ts: 0,
+            item_hashes: collect_item_hashes(&[old_item]).into_iter().collect::<HashMap<_, _>>(),
+            last_failed_item: None,
+        };
+        let remote = InMemoryRemote::new();
+        let actions = plan_files_with_concurrency(
+            &[new_item],
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+            Some(&state),
+            true,
+        )
+        .await;
+        assert!(matches!(&actions[0], FileAction::Apply { dst, .. } if dst == "/r/b.txt"));
+    }
+
+    #[tokio::test]
+    async fn changing_chmod_invalidates_file_cache() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let mut old_item = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        old_item.chmod = Some("600".into());
+        let mut new_item = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        new_item.chmod = Some("644".into());
+        let state = HostState {
+            host: "h".into(),
+            last_sync_ts: 0,
+            item_hashes: collect_item_hashes(&[old_item]).into_iter().collect::<HashMap<_, _>>(),
+            last_failed_item: None,
+        };
+        let remote = InMemoryRemote::new();
+        let actions = plan_files_with_concurrency(
+            &[new_item],
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+            Some(&state),
+            true,
+        )
+        .await;
+        assert!(matches!(&actions[0], FileAction::Apply { chmod: Some(0o644), .. }));
+    }
+
+    #[tokio::test]
+    async fn execute_skips_if_remote_changed_between_plan_and_execute() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"new");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Sync)], &remote).await;
+        remote.write_file("/r/a.txt", b"external").await.unwrap();
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
+        assert!(matches!(outcome, ItemOutcome::Skipped(SkipReason::RemoteNewer)));
     }
 }

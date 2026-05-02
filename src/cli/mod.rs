@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use dialoguer::{Confirm, Password};
 use futures::StreamExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::warn;
 
@@ -336,7 +336,7 @@ fn build_pipeline_opts(opts: &SyncRunOptions) -> Result<PipelineOpts> {
     Ok(PipelineOpts {
         dry_run: opts.dry_run,
         diff: opts.diff,
-        max_concurrency: opts.max_concurrency.unwrap_or(8),
+        max_concurrency: opts.max_concurrency.unwrap_or(8).max(1),
         retry: RetryPolicy {
             max_attempts: opts.retries.max(1),
             base_backoff: std::time::Duration::from_millis(200),
@@ -404,7 +404,20 @@ fn save_host_state(
     host: &str,
     summary: &crate::reporter::PipelineSummary,
 ) {
-    if summary.dry_run || summary.interrupted || summary.total_failed() > 0 {
+    if summary.dry_run || summary.interrupted {
+        return;
+    }
+    if summary.total_failed() > 0 {
+        let mut state = state::load(host).unwrap_or_else(|| HostState {
+            host: host.to_string(),
+            last_sync_ts: 0,
+            item_hashes: HashMap::new(),
+            last_failed_item: None,
+        });
+        state.last_failed_item = summary.first_failed_item.clone();
+        if let Err(err) = state::save(&state) {
+            warn!("failed to save state for {host}: {err}");
+        }
         return;
     }
     let mut item_hashes = crate::sync::file::collect_item_hashes(&config.file);
@@ -684,6 +697,16 @@ mod tests {
     }
 
     #[test]
+    fn build_pipeline_opts_clamps_zero_max_concurrency() {
+        let opts = build_pipeline_opts(&SyncRunOptions {
+            max_concurrency: Some(0),
+            ..SyncRunOptions::default()
+        })
+        .unwrap();
+        assert_eq!(opts.max_concurrency, 1);
+    }
+
+    #[test]
     fn dry_run_does_not_write_state() {
         let _guard = state_env_lock().lock().unwrap();
         let dir = TempDir::new().unwrap();
@@ -702,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_does_not_write_state() {
+    fn failed_run_updates_only_last_failed_item() {
         let _guard = state_env_lock().lock().unwrap();
         let dir = TempDir::new().unwrap();
         std::env::set_var("FLUX_STATE_DIR", dir.path());
@@ -732,7 +755,44 @@ mod tests {
 
         save_host_state(&config, dir.path(), "example", &summary);
 
-        assert_eq!(load("example"), Some(existing));
+        assert_eq!(
+            load("example"),
+            Some(HostState {
+                last_failed_item: Some("new".into()),
+                ..existing
+            })
+        );
+    }
+
+    #[test]
+    fn failed_first_run_persists_failed_item_without_hashes() {
+        let _guard = state_env_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        std::env::set_var("FLUX_STATE_DIR", dir.path());
+        let config: Config = serde_yml::from_str("host: example\n").unwrap();
+        let summary = PipelineSummary {
+            stages: vec![StageSummary {
+                stage: crate::reporter::Stage::File,
+                applied: 0,
+                skipped: 0,
+                failed: 1,
+            }],
+            interrupted: false,
+            dry_run: false,
+            first_failed_item: Some("broken-item".into()),
+        };
+
+        save_host_state(&config, dir.path(), "example", &summary);
+
+        assert_eq!(
+            load("example"),
+            Some(HostState {
+                host: "example".into(),
+                last_sync_ts: 0,
+                item_hashes: HashMap::new(),
+                last_failed_item: Some("broken-item".into()),
+            })
+        );
     }
 
     #[test]

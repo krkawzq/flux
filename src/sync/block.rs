@@ -5,6 +5,7 @@ use crate::config::{BlockItem, SyncMode};
 use crate::path::FluxPath;
 use crate::remote::{with_retry, RemoteOps, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
+use crate::sync::file::apply_atomic_bytes;
 use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -423,7 +424,8 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
             };
             match compose(&current, body, sentinel, template, &name) {
                 Ok(content) => {
-                    match with_retry(policy, || remote.write_file(target, content.as_bytes())).await
+                    match apply_atomic_bytes(remote, target, content.as_bytes(), None, policy, 3)
+                        .await
                     {
                         Ok(()) => ItemOutcome::Applied,
                         Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
@@ -752,6 +754,61 @@ mod tests {
             outcome,
             ItemOutcome::Skipped(SkipReason::RemoteNewer)
         ));
+    }
+
+    #[tokio::test]
+    async fn execute_block_creates_backup_and_can_be_undone() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("aliases.sh"), b"alias x='1'\n").unwrap();
+        let remote =
+            InMemoryRemote::with_files([("/remote/.bashrc", b"export PATH=/bin\n".to_vec())]);
+        remote.add_exec_rule(crate::remote::fake::ExecRule {
+            matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
+            status: 0,
+            stdout: vec![],
+            stderr: vec![],
+        });
+        let item = BlockItem {
+            name: "aliases".into(),
+            path: "aliases.sh".into(),
+            file: ":/remote/.bashrc".into(),
+            mode: SyncMode::Cover,
+            comment_template: None,
+            tags: vec![],
+        };
+        let actions = plan_blocks_with_concurrency(
+            &[item],
+            tmp.path(),
+            "# {}",
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+            None,
+            false,
+        )
+        .await;
+        let reporter = crate::reporter::memory::CapturedReporter::new();
+        let outcome = execute_block(
+            &actions[0],
+            &remote,
+            "# {}",
+            &reporter,
+            RetryPolicy::no_retry(),
+        )
+        .await;
+        assert!(matches!(outcome, ItemOutcome::Applied));
+        let applied = String::from_utf8(remote.file_contents("/remote/.bashrc").unwrap()).unwrap();
+        assert!(applied.contains("alias x='1'"));
+        let backup = remote
+            .file_paths()
+            .into_iter()
+            .find(|path| path.starts_with("/remote/.bashrc.flux-") && path.ends_with(".bak"))
+            .expect("backup path");
+        remote.rename(&backup, "/remote/.bashrc").await.unwrap();
+        assert_eq!(
+            remote.file_contents("/remote/.bashrc"),
+            Some(b"export PATH=/bin\n".to_vec())
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// SSH client wrapper
 pub struct SshClient {
@@ -35,6 +36,26 @@ struct HandlerState {
 /// Client handler for russh
 struct ClientHandler {
     state: Arc<Mutex<HandlerState>>,
+}
+
+struct AbortOnDrop {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AbortOnDrop {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -344,17 +365,17 @@ impl SshClient {
         let mut exit_code = None;
         let mut first_ctrl_c = None::<Instant>;
         let active_cancellation;
-        let signal_task = if let Some(cancellation) = cancellation {
+        let _signal_task = if let Some(cancellation) = cancellation {
             active_cancellation = cancellation.clone();
             None
         } else {
             active_cancellation = SharedCancellation::new();
             let state = active_cancellation.clone();
-            Some(tokio::spawn(async move {
+            Some(AbortOnDrop::new(tokio::spawn(async move {
                 while tokio::signal::ctrl_c().await.is_ok() {
                     state.press();
                 }
-            }))
+            })))
         };
         let mut seen_presses = active_cancellation.presses();
         let timeout_label = timeout;
@@ -494,9 +515,6 @@ impl SshClient {
             }
         }
 
-        if let Some(task) = signal_task {
-            task.abort();
-        }
         channel.close().await.ok();
 
         Ok(exit_code.unwrap_or(0))
@@ -819,7 +837,20 @@ fn map_anyhow(error: anyhow::Error) -> RemoteOpsError {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_escape;
+    use super::{shell_escape, AbortOnDrop};
+    use futures::future::pending;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     #[test]
     fn shell_escape_neutralizes_dollar_sign() {
@@ -834,5 +865,18 @@ mod tests {
     #[test]
     fn shell_escape_handles_embedded_single_quote() {
         assert_eq!(shell_escape("a'b"), r"'a'\''b'");
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_background_task() {
+        let (tx, rx) = oneshot::channel();
+        let guard = AbortOnDrop::new(tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(tx));
+            pending::<()>().await;
+        }));
+        drop(guard);
+        assert!(tokio::time::timeout(Duration::from_millis(100), rx)
+            .await
+            .is_ok());
     }
 }

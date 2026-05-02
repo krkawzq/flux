@@ -14,16 +14,23 @@ pub enum SshConfigError {
     InvalidPort(String),
     #[error("io: {0}")]
     Io(String),
+    #[error("invalid value for {field}: {snippet}")]
+    InvalidValue {
+        field: &'static str,
+        snippet: String,
+    },
 }
 
-pub fn parse_ssh_host(spec: &str) -> Result<(Option<String>, String, u16), SshConfigError> {
+pub fn parse_ssh_host(
+    spec: &str,
+) -> std::result::Result<(Option<String>, String, u16), SshConfigError> {
     parse_ssh_host_inner(spec, 22)
 }
 
 fn parse_ssh_host_inner(
     spec: &str,
     default_port: u16,
-) -> Result<(Option<String>, String, u16), SshConfigError> {
+) -> std::result::Result<(Option<String>, String, u16), SshConfigError> {
     let (user, hostport) = match spec.find('@') {
         Some(index) => (Some(spec[..index].to_string()), &spec[index + 1..]),
         None => (None, spec),
@@ -67,11 +74,15 @@ pub fn save_ssh_config(name: &str, config: &crate::config::Config) -> Result<()>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => bail!(SshConfigError::Io(err.to_string())),
     };
-    let updated = replace_or_append_host(&existing, name, config);
+    let updated = replace_or_append_host(&existing, name, config)?;
     std::fs::write(&config_path, updated).context("writing ~/.ssh/config")
 }
 
-pub fn replace_or_append_host(existing: &str, name: &str, cfg: &crate::config::Config) -> String {
+pub fn replace_or_append_host(
+    existing: &str,
+    name: &str,
+    cfg: &crate::config::Config,
+) -> std::result::Result<String, SshConfigError> {
     let mut out = String::new();
     let mut skipping = false;
     let host_line = format!("Host {name}");
@@ -94,11 +105,22 @@ pub fn replace_or_append_host(existing: &str, name: &str, cfg: &crate::config::C
     if !out.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(&render_host_block(name, cfg));
-    out
+    out.push_str(&render_host_block(name, cfg)?);
+    Ok(out)
 }
 
-fn render_host_block(name: &str, cfg: &crate::config::Config) -> String {
+fn render_host_block(
+    name: &str,
+    cfg: &crate::config::Config,
+) -> std::result::Result<String, SshConfigError> {
+    validate_ssh_config_value("host", name)?;
+    validate_ssh_config_value("HostName", cfg.host.as_deref().unwrap_or_default())?;
+    if let Some(user) = &cfg.user {
+        validate_ssh_config_value("User", user)?;
+    }
+    if let Some(key) = &cfg.key {
+        validate_ssh_config_value("IdentityFile", key)?;
+    }
     let mut output = String::new();
     output.push_str(&format!("Host {name}\n"));
     output.push_str(&format!(
@@ -114,7 +136,22 @@ fn render_host_block(name: &str, cfg: &crate::config::Config) -> String {
     if let Some(key) = &cfg.key {
         output.push_str(&format!("    IdentityFile {key}\n"));
     }
-    output
+    Ok(output)
+}
+
+fn validate_ssh_config_value(
+    field: &'static str,
+    value: &str,
+) -> std::result::Result<(), SshConfigError> {
+    if value.chars().any(char::is_control) {
+        let snippet: String = value
+            .chars()
+            .flat_map(char::escape_default)
+            .take(32)
+            .collect();
+        return Err(SshConfigError::InvalidValue { field, snippet });
+    }
+    Ok(())
 }
 
 pub fn read_ssh_config_entry(name: &str) -> Result<Option<SshEntry>> {
@@ -295,7 +332,7 @@ mod tests {
     #[test]
     fn replace_or_append_keeps_other_hosts() {
         let pre = "Host foo\n    HostName 1.1.1.1\n\nHost bar\n    HostName 2.2.2.2\n";
-        let out = replace_or_append_host(pre, "foo", &config("9.9.9.9", None));
+        let out = replace_or_append_host(pre, "foo", &config("9.9.9.9", None)).unwrap();
         assert!(out.contains("Host bar"));
         assert!(out.contains("HostName 9.9.9.9"));
         assert!(!out.contains("HostName 1.1.1.1"));
@@ -305,11 +342,29 @@ mod tests {
     fn replace_skips_through_comments_to_next_host() {
         let pre =
             "Host foo\n    HostName 1.1.1.1\n    # a comment\n    User old\n\nHost bar\n    HostName 2.2.2.2\n";
-        let out = replace_or_append_host(pre, "foo", &config("9.9.9.9", Some("new")));
+        let out = replace_or_append_host(pre, "foo", &config("9.9.9.9", Some("new"))).unwrap();
         assert!(out.contains("Host bar"));
         assert!(out.contains("HostName 9.9.9.9"));
         assert!(out.contains("User new"));
         assert!(!out.contains("User old"));
         assert!(!out.contains("# a comment"));
+    }
+
+    #[test]
+    fn replace_rejects_control_characters_in_host_fields() {
+        let err =
+            replace_or_append_host("", "ok\nmalicious", &config("9.9.9.9", None)).unwrap_err();
+        assert!(matches!(
+            err,
+            SshConfigError::InvalidValue { field: "host", .. }
+        ));
+    }
+
+    #[test]
+    fn replace_accepts_normal_host_fields() {
+        let out = replace_or_append_host("", "ok", &config("9.9.9.9", Some("alice"))).unwrap();
+        assert!(out.contains("Host ok\n"));
+        assert!(out.contains("HostName 9.9.9.9\n"));
+        assert!(out.contains("User alice\n"));
     }
 }

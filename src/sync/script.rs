@@ -349,6 +349,37 @@ mod tests {
         assert_eq!(remote.interactive_calls()[0].1, Some(timeout));
     }
 
+    #[tokio::test]
+    async fn run_action_returns_failed_on_interactive_timeout() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\nsleep 30").unwrap();
+        let actions = plan_scripts(
+            &[item("s", "s.sh")],
+            tmp.path(),
+            "/bin/bash",
+            &[],
+            None,
+            false,
+        )
+        .await;
+        let remote = InMemoryRemote::new();
+        remote.fail_next(
+            "interactive_exec",
+            crate::remote::RemoteOpsError::Transport("interactive_exec timed out".into()),
+        );
+        let reporter = CapturedReporter::new();
+        let outcome = execute_script::<InMemoryRemote>(
+            &actions[0],
+            &remote,
+            &reporter,
+            RetryPolicy::no_retry(),
+            Some(Duration::from_millis(10)),
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, ItemOutcome::Failed(_)));
+    }
+
     proptest::proptest! {
         #[test]
         fn shell_quote_round_trip(input in r#"[^\x00]{0,40}"#) {

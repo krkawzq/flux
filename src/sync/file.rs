@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -93,7 +94,7 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(
         ItemKind::Auto => unreachable!("auto should resolve before dispatch"),
         ItemKind::File => vec![plan_single_file(item, remote, policy, state, use_cache).await],
         ItemKind::Glob => plan_glob(item, remote, policy, state, use_cache).await,
-        ItemKind::Dir => vec![plan_dir(item, state, use_cache)],
+        ItemKind::Dir => plan_dir(item, remote, policy, state, use_cache).await,
         ItemKind::Link => vec![plan_link(item, state, use_cache)],
     }
 }
@@ -273,46 +274,52 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
     }
 }
 
-fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
+async fn plan_dir<R: RemoteOps + ?Sized>(
+    item: &FileItem,
+    remote: &R,
+    policy: RetryPolicy,
+    state: Option<&HostState>,
+    use_cache: bool,
+) -> Vec<FileAction> {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let mode = item.mode.clone();
     let chmod = match parse_chmod(item.chmod.as_deref()) {
         Ok(chmod) => chmod,
         Err(error) => {
-            return FileAction::Failed {
+            return vec![FileAction::Failed {
                 item_name,
                 error: error.into(),
-            };
+            }];
         }
     };
     let (src_dir, dst_dir) = match resolve_local_remote(&item.src, &item.dst) {
         Ok(paths) => paths,
         Err(error) => {
-            return FileAction::Failed {
+            return vec![FileAction::Failed {
                 item_name,
                 error: error.into(),
-            };
+            }];
         }
     };
     match std::fs::metadata(&src_dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
-            return FileAction::Failed {
+            return vec![FileAction::Failed {
                 item_name,
                 error: FileError::SourceIsDirectory(src_dir.display().to_string()).into(),
-            };
+            }];
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return FileAction::Failed {
+            return vec![FileAction::Failed {
                 item_name,
                 error: FileError::SourceNotFound(src_dir.display().to_string()).into(),
-            };
+            }];
         }
         Err(err) => {
-            return FileAction::Failed {
+            return vec![FileAction::Failed {
                 item_name,
                 error: FileError::LocalIo(err.to_string()).into(),
-            };
+            }];
         }
     }
 
@@ -335,26 +342,52 @@ fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> File
         files.push((path, relative));
     }
 
+    if files.is_empty() {
+        return vec![FileAction::ApplyDir {
+            item_name,
+            src_dir,
+            dst_dir,
+            files,
+            chmod,
+        }];
+    }
+
     if use_cache {
         let dir_hash = dir_cache_key(&files, &dst_dir, &mode, chmod);
         if state
             .and_then(|state| state.item_hashes.get(&item_name))
             .is_some_and(|cached| cached == &dir_hash)
         {
-            return FileAction::Skip {
+            return vec![FileAction::Skip {
                 item_name,
                 reason: SkipReason::ContentUnchanged,
-            };
+            }];
         }
     }
 
-    FileAction::ApplyDir {
-        item_name,
-        src_dir,
-        dst_dir,
-        files,
-        chmod,
+    let mut actions = Vec::with_capacity(files.len());
+    for (path, relative) in files {
+        let dst = join_remote_path(&dst_dir, &relative);
+        let action_name = format!("{item_name}:{relative}");
+        if use_cache {
+            if let Some(hash) = regular_file_cache_key(&path, &dst, &mode, chmod) {
+                if state
+                    .and_then(|state| state.item_hashes.get(&action_name))
+                    .is_some_and(|cached| cached == &hash)
+                {
+                    actions.push(FileAction::Skip {
+                        item_name: action_name,
+                        reason: SkipReason::ContentUnchanged,
+                    });
+                    continue;
+                }
+            }
+        }
+        actions.push(
+            plan_regular_file(action_name, path, dst, mode.clone(), chmod, remote, policy).await,
+        );
     }
+    actions
 }
 
 fn plan_link(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
@@ -459,25 +492,25 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
             ItemKind::Dir => {
                 let name = item.name.clone().unwrap_or_else(|| item.src.clone());
                 if let Ok((src_dir, dst_dir)) = resolve_local_remote(&item.src, &item.dst) {
-                    let files = WalkDir::new(&src_dir)
-                        .into_iter()
-                        .filter_map(Result::ok)
-                        .filter(|entry| entry.file_type().is_file())
-                        .map(|entry| {
-                            let path = entry.path().to_path_buf();
-                            let relative = path
-                                .strip_prefix(&src_dir)
-                                .ok()
-                                .map(path_to_unix)
-                                .unwrap_or_default();
-                            (path, relative)
-                        })
-                        .collect::<Vec<_>>();
                     let chmod = item
                         .chmod
                         .as_deref()
                         .and_then(|value| u32::from_str_radix(value, 8).ok());
-                    hashes.insert(name, dir_cache_key(&files, &dst_dir, &item.mode, chmod));
+                    for entry in WalkDir::new(&src_dir).into_iter().filter_map(Result::ok) {
+                        if !entry.file_type().is_file() {
+                            continue;
+                        }
+                        let path = entry.path().to_path_buf();
+                        let relative = path
+                            .strip_prefix(&src_dir)
+                            .ok()
+                            .map(path_to_unix)
+                            .unwrap_or_default();
+                        let dst = join_remote_path(&dst_dir, &relative);
+                        if let Some(hash) = regular_file_cache_key(&path, &dst, &item.mode, chmod) {
+                            hashes.insert(format!("{name}:{relative}"), hash);
+                        }
+                    }
                 }
             }
             ItemKind::Link => {
@@ -681,24 +714,47 @@ async fn apply_file_path<R: RemoteOps + ?Sized>(
     chmod: Option<u32>,
     policy: RetryPolicy,
 ) -> Result<(), RemoteOpsError> {
+    let bytes = read_local_bytes(src).map_err(|err| RemoteOpsError::Io(err.to_string()))?;
+    apply_atomic_bytes(remote, dst, &bytes, chmod, policy, 3).await
+}
+
+pub(crate) async fn apply_atomic_bytes<R: RemoteOps + ?Sized>(
+    remote: &R,
+    dst: &str,
+    bytes: &[u8],
+    chmod: Option<u32>,
+    policy: RetryPolicy,
+    backup_limit: usize,
+) -> Result<(), RemoteOpsError> {
     if let Some(parent) = parent_dir(dst) {
         with_retry(policy, || remote.ensure_dir(parent)).await?;
     }
-    let bytes = read_local_bytes(src).map_err(|err| RemoteOpsError::Io(err.to_string()))?;
     let tmp = unique_tmp_path(dst);
-    with_retry(policy, || remote.write_file(&tmp, &bytes)).await?;
+    with_retry(policy, || remote.write_file(&tmp, bytes)).await?;
     if let Some(mode) = chmod {
         let current_mode = with_retry(policy, || remote.stat_mode(&tmp)).await.ok();
         if current_mode != Some(mode) {
             with_retry(policy, || remote.chmod(&tmp, mode)).await?;
         }
     }
-    if with_retry(policy, || remote.exists(dst)).await? {
+    let backup = if with_retry(policy, || remote.exists(dst)).await? {
         let backup = unique_backup_path(dst);
         remote.rename(dst, &backup).await?;
-        rotate_backups(remote, dst, 3, policy).await?;
+        Some(backup)
+    } else {
+        None
+    };
+    if let Err(err) = remote.rename(&tmp, dst).await {
+        if let Some(backup) = backup.as_deref() {
+            if let Err(rollback_err) = remote.rename(backup, dst).await {
+                warn!("failed to roll back {dst} from {backup}: {rollback_err}");
+            }
+        }
+        return Err(err);
     }
-    remote.rename(&tmp, dst).await?;
+    if backup.is_some() {
+        rotate_backups(remote, dst, backup_limit, policy).await?;
+    }
     Ok(())
 }
 
@@ -1008,8 +1064,11 @@ mod tests {
     use super::*;
     use crate::cli::state::HostState;
     use crate::remote::fake::InMemoryRemote;
+    use crate::remote::{ExecOutput, RemoteOps, SharedCancellation};
     use crate::reporter::memory::CapturedReporter;
+    use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
     fn local_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
@@ -1080,7 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dir_recursion_plans_apply_dir() {
+    async fn dir_recursion_plans_per_file_actions() {
         let tmp = TempDir::new().unwrap();
         local_file(&tmp, "dir/a.txt", b"a");
         local_file(&tmp, "dir/nested/b.txt", b"b");
@@ -1093,14 +1152,17 @@ mod tests {
         dir_item.kind = ItemKind::Dir;
         let remote = InMemoryRemote::new();
         let actions = plan_files(&[dir_item], &remote).await;
-        match &actions[0] {
-            FileAction::ApplyDir { files, .. } => {
-                assert_eq!(files.len(), 2);
-                assert!(files.iter().any(|(_, dst)| dst == "a.txt"));
-                assert!(files.iter().any(|(_, dst)| dst == "nested/b.txt"));
-            }
-            other => panic!("expected ApplyDir, got {other:?}"),
-        }
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            FileAction::Apply { item_name, dst, .. }
+                if item_name == "dir:a.txt" && dst == "/r/dir/a.txt"
+        ));
+        assert!(matches!(
+            &actions[1],
+            FileAction::Apply { item_name, dst, .. }
+                if item_name == "dir:nested/b.txt" && dst == "/r/dir/nested/b.txt"
+        ));
     }
 
     #[tokio::test]
@@ -1164,6 +1226,53 @@ mod tests {
                 reason: SkipReason::RemoteNewer,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dir_touch_skips_existing_child_files() {
+        let tmp = TempDir::new().unwrap();
+        local_file(&tmp, "dir/a.txt", b"a");
+        let mut dir_item = item(
+            "dir",
+            &tmp.path().join("dir").to_string_lossy(),
+            ":/r/dir",
+            SyncMode::Touch,
+        );
+        dir_item.kind = ItemKind::Dir;
+        let remote = InMemoryRemote::with_files([("/r/dir/a.txt", b"old".to_vec())]);
+        let actions = plan_files(&[dir_item], &remote).await;
+        assert!(matches!(
+            &actions[0],
+            FileAction::Skip {
+                item_name,
+                reason: SkipReason::AlreadyExists,
+            } if item_name == "dir:a.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dir_sync_skips_child_when_remote_is_newer() {
+        use chrono::{Duration, Utc};
+
+        let tmp = TempDir::new().unwrap();
+        local_file(&tmp, "dir/a.txt", b"a");
+        let mut dir_item = item(
+            "dir",
+            &tmp.path().join("dir").to_string_lossy(),
+            ":/r/dir",
+            SyncMode::Sync,
+        );
+        dir_item.kind = ItemKind::Dir;
+        let remote = InMemoryRemote::with_files([("/r/dir/a.txt", b"old".to_vec())]);
+        remote.set_mtime("/r/dir/a.txt", Utc::now() + Duration::seconds(60));
+        let actions = plan_files(&[dir_item], &remote).await;
+        assert!(matches!(
+            &actions[0],
+            FileAction::Skip {
+                item_name,
+                reason: SkipReason::RemoteNewer,
+            } if item_name == "dir:a.txt"
         ));
     }
 
@@ -1484,5 +1593,95 @@ mod tests {
         let reporter = CapturedReporter::new();
         let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::default()).await;
         assert!(matches!(outcome, ItemOutcome::Failed(_)));
+    }
+
+    struct FailSecondRenameRemote {
+        inner: InMemoryRemote,
+        rename_calls: AtomicUsize,
+    }
+
+    impl FailSecondRenameRemote {
+        fn with_files<S: Into<String>, B: Into<Vec<u8>>>(
+            files: impl IntoIterator<Item = (S, B)>,
+        ) -> Self {
+            Self {
+                inner: InMemoryRemote::with_files(files),
+                rename_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.inner.file_contents(path)
+        }
+    }
+
+    #[async_trait]
+    impl RemoteOps for FailSecondRenameRemote {
+        async fn exec(&self, cmd: &str) -> Result<ExecOutput, RemoteOpsError> {
+            self.inner.exec(cmd).await
+        }
+
+        async fn read_file(&self, path: &str) -> Result<Vec<u8>, RemoteOpsError> {
+            self.inner.read_file(path).await
+        }
+
+        async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), RemoteOpsError> {
+            self.inner.write_file(path, data).await
+        }
+
+        async fn exists(&self, path: &str) -> Result<bool, RemoteOpsError> {
+            self.inner.exists(path).await
+        }
+
+        async fn mtime(&self, path: &str) -> Result<chrono::DateTime<chrono::Utc>, RemoteOpsError> {
+            self.inner.mtime(path).await
+        }
+
+        async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError> {
+            self.inner.stat_mode(path).await
+        }
+
+        async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError> {
+            self.inner.chmod(path, mode).await
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteOpsError> {
+            let call = self.rename_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 1 {
+                return Err(RemoteOpsError::Transport("rename flake".into()));
+            }
+            self.inner.rename(from, to).await
+        }
+
+        async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
+            self.inner.remove_file(path).await
+        }
+
+        async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError> {
+            self.inner.ensure_dir(path).await
+        }
+
+        async fn interactive_exec(
+            &self,
+            cmd: &str,
+            timeout: Option<std::time::Duration>,
+            cancellation: Option<&SharedCancellation>,
+        ) -> Result<i32, RemoteOpsError> {
+            self.inner
+                .interactive_exec(cmd, timeout, cancellation)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_apply_restores_backup_if_second_rename_fails() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"new");
+        let remote = FailSecondRenameRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Cover)], &remote).await;
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
+        assert!(matches!(outcome, ItemOutcome::Failed(_)));
+        assert_eq!(remote.file_contents("/r/a.txt"), Some(b"old".to_vec()));
     }
 }

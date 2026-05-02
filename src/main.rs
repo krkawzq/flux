@@ -22,7 +22,7 @@ enum Commands {
         diff: bool,
         #[arg(long, value_enum, default_value = "text")]
         log_format: flux::cli::LogFormat,
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_positive_usize)]
         max_concurrency: Option<usize>,
         #[arg(long, default_value = "3")]
         retries: u8,
@@ -63,6 +63,16 @@ enum Commands {
         #[arg(long, default_value = "5")]
         retry: u64,
     },
+}
+
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{raw}': expected a positive integer"))?;
+    if value == 0 {
+        return Err("value must be at least 1".into());
+    }
+    Ok(value)
 }
 
 #[tokio::main]
@@ -122,5 +132,19 @@ async fn main() -> anyhow::Result<()> {
             key,
             retry,
         } => flux::cli::run_proxy(host, local, remote, key, retry).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn sync_rejects_zero_max_concurrency() {
+        let err = Cli::try_parse_from(["flux", "sync", "config.yml", "--max-concurrency", "0"])
+            .err()
+            .expect("clap should reject zero");
+        assert!(err.to_string().contains("at least 1"));
     }
 }

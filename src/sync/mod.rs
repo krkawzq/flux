@@ -232,7 +232,7 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                             .await,
                     )
                 })
-                .buffer_unordered(self.opts.max_concurrency)
+                .buffer_unordered(self.opts.max_concurrency.max(1))
                 .collect()
                 .await;
         let mut ordered = outcomes;
@@ -331,7 +331,7 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                     }
                     outcomes
                 })
-                .buffer_unordered(self.opts.max_concurrency)
+                .buffer_unordered(self.opts.max_concurrency.max(1))
                 .collect()
                 .await;
         let mut ordered: Vec<(usize, String, ItemOutcome)> =
@@ -842,6 +842,38 @@ mod tests {
         };
         let summary = pipe.run().await;
         assert_eq!(summary.total_failed(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_max_concurrency_still_runs_pipeline() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a");
+        std::fs::write(&src, b"hi").unwrap();
+        let config = minimal_config(vec![FileItem {
+            name: Some("a".into()),
+            src: src.to_string_lossy().into_owned(),
+            dst: ":/r/a".into(),
+            kind: ItemKind::Auto,
+            target: None,
+            mode: SyncMode::Cover,
+            chmod: None,
+            tags: vec![],
+        }]);
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let pipe = Pipeline {
+            config: &config,
+            asset_root: tmp.path(),
+            remote: &remote,
+            reporter: &reporter,
+            opts: PipelineOpts {
+                max_concurrency: 0,
+                ..PipelineOpts::default()
+            },
+        };
+        let summary = pipe.run().await;
+        assert_eq!(summary.total_failed(), 0);
+        assert_eq!(remote.file_contents("/r/a"), Some(b"hi".to_vec()));
     }
 
     #[tokio::test]

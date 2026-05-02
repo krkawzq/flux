@@ -186,7 +186,13 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
         }
     };
     let chosen_template = item.comment_template.as_deref().unwrap_or(template);
-    let local_hash = block_cache_key(&item_name, &local_body, &target, &item.mode, chosen_template);
+    let local_hash = block_cache_key(
+        &item_name,
+        &local_body,
+        &target,
+        &item.mode,
+        chosen_template,
+    );
     if use_cache
         && state
             .and_then(|state| state.item_hashes.get(&item_name))
@@ -389,7 +395,11 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
         } => {
             if remote_changed_since_plan(remote, target, *observed_remote_mtime, policy).await {
                 reporter.warning(&format!("skipping {target}: remote changed after planning"));
-                return finish_block(reporter, &name, ItemOutcome::Skipped(SkipReason::RemoteNewer));
+                return finish_block(
+                    reporter,
+                    &name,
+                    ItemOutcome::Skipped(SkipReason::RemoteNewer),
+                );
             }
             let current = match with_retry(policy, || remote.exists(target)).await {
                 Ok(true) => match with_retry(policy, || remote.read_file(target)).await {
@@ -452,11 +462,17 @@ fn compose(
     template: &str,
     name: &str,
 ) -> Result<String, BlockError> {
+    let eol = detect_eol(existing);
+    let normalized_body = normalize_eol(body, eol);
     let injected = format!(
-        "{}\n{}{}{}\n",
+        "{}{eol}{}{}{}{eol}",
         sentinel.open_marker,
-        body,
-        if body.ends_with('\n') { "" } else { "\n" },
+        normalized_body,
+        if normalized_body.ends_with(eol) {
+            ""
+        } else {
+            eol
+        },
         sentinel.close_marker,
     );
     match find_block(template, name, existing)? {
@@ -469,13 +485,25 @@ fn compose(
         }
         None => {
             let mut out = String::from(existing);
-            if !out.ends_with('\n') && !out.is_empty() {
-                out.push('\n');
+            if !out.ends_with('\n') && !out.ends_with("\r\n") && !out.is_empty() {
+                out.push_str(eol);
             }
             out.push_str(&injected);
             Ok(out)
         }
     }
+}
+
+fn detect_eol(existing: &str) -> &'static str {
+    if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn normalize_eol(input: &str, eol: &str) -> String {
+    input.replace("\r\n", "\n").replace('\n', eol)
 }
 
 fn resolve_block_path(asset_root: &Path, path: &str) -> PathBuf {
@@ -678,7 +706,9 @@ mod tests {
             true,
         )
         .await;
-        assert!(matches!(&actions[0], BlockAction::Apply { target, .. } if target == "/remote/.zshrc"));
+        assert!(
+            matches!(&actions[0], BlockAction::Apply { target, .. } if target == "/remote/.zshrc")
+        );
     }
 
     #[tokio::test]
@@ -705,7 +735,10 @@ mod tests {
             false,
         )
         .await;
-        remote.write_file("/remote/.bashrc", b"external\n").await.unwrap();
+        remote
+            .write_file("/remote/.bashrc", b"external\n")
+            .await
+            .unwrap();
         let reporter = crate::reporter::memory::CapturedReporter::new();
         let outcome = execute_block(
             &actions[0],
@@ -715,6 +748,27 @@ mod tests {
             RetryPolicy::no_retry(),
         )
         .await;
-        assert!(matches!(outcome, ItemOutcome::Skipped(SkipReason::RemoteNewer)));
+        assert!(matches!(
+            outcome,
+            ItemOutcome::Skipped(SkipReason::RemoteNewer)
+        ));
+    }
+
+    #[test]
+    fn compose_preserves_crlf_style() {
+        let output = compose(
+            "alpha\r\n",
+            "beta\nline2\n",
+            &Sentinel {
+                name: "n".into(),
+                timestamp: 1,
+                open_marker: "# >>> n:1 >>>".into(),
+                close_marker: "# <<< n:1 <<<".into(),
+            },
+            "# {}",
+            "n",
+        )
+        .unwrap();
+        assert!(output.contains("\r\n# >>> n:1 >>>\r\nbeta\r\nline2\r\n# <<< n:1 <<<\r\n"));
     }
 }

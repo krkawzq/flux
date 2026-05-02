@@ -37,6 +37,7 @@ cargo build --release
 ## Schema notes
 
 - `.flux/.env` is auto-loaded; reference variables in YAML as `${VAR}` or `${VAR:-default}`.
+- Use `$$` when you need a literal `$`, including examples and comments like `$${HOME}`.
 - Secrets can use `password: "keychain:service.account"` (macOS Keychain / Linux secret-tool).
 - `imports: [base.yml, work.yml]` lets you compose configs (deep-merge, later overrides earlier).
 - File items support `kind: file|dir|glob|link` (Auto detected; only `link` must be explicit).

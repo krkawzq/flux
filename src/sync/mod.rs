@@ -12,8 +12,8 @@ pub mod script;
 use crate::cli::state::HostState;
 use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
-use crate::remote::{RetryPolicy, SharedCancellation};
 use crate::remote::{with_retry, RemoteOps, RemoteOpsError};
+use crate::remote::{RetryPolicy, SharedCancellation};
 use crate::reporter::console::print_plan_with_diff;
 use crate::reporter::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
 use crate::sync::plan::{
@@ -88,15 +88,18 @@ pub struct Pipeline<'a, R: RemoteOps + ?Sized> {
 
 impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
     pub async fn plan(&self) -> Plan {
-        let register_pubkey = self.config.register_key.then(|| RegisterPubkeyAction {
-            local_pubkey_path: self
-                .config
+        let register_pubkey = if self.config.register_key {
+            self.config
                 .key
-                .clone()
-                .map(|key| format!("{key}.pub"))
-                .unwrap_or_default(),
-            remote_authorized_keys: "~/.ssh/authorized_keys".into(),
-        });
+                .as_ref()
+                .filter(|key| !key.is_empty())
+                .map(|key| RegisterPubkeyAction {
+                    local_pubkey_path: format!("{key}.pub"),
+                    remote_authorized_keys: "~/.ssh/authorized_keys".into(),
+                })
+        } else {
+            None
+        };
         let file_actions = file::plan_files_with_concurrency(
             &self.config.file,
             self.remote,
@@ -156,11 +159,7 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 },
             );
         }
-        let cancellation = self
-            .opts
-            .cancellation
-            .clone()
-            .unwrap_or_else(SharedCancellation::new);
+        let cancellation = self.opts.cancellation.clone().unwrap_or_default();
         let listener_state = cancellation.clone();
         let signal_task = tokio::spawn(async move {
             while tokio::signal::ctrl_c().await.is_ok() {
@@ -681,21 +680,15 @@ pub struct SshConfigInfo {
 fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
     let host = match &config.host {
         Some(host) if !host.is_empty() => host.clone(),
-        _ => Input::new().with_prompt("Host").interact_text()?,
+        _ => prompt_required("Host")?,
     };
     let port = match config.port {
         Some(port) if port > 0 => port,
-        _ => Input::new()
-            .with_prompt("Port")
-            .default(22u16)
-            .interact_text()?,
+        _ => prompt_with_default("Port", 22u16)?,
     };
     let user = match &config.user {
         Some(user) if !user.is_empty() => user.clone(),
-        _ => Input::new()
-            .with_prompt("User")
-            .default("root".to_string())
-            .interact_text()?,
+        _ => prompt_with_default("User", "root".to_string())?,
     };
     let key_path = config.key.clone();
     let password = match &config.password {
@@ -726,6 +719,29 @@ fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
         key_path,
         password,
     })
+}
+
+fn prompt_required(prompt: &str) -> Result<String> {
+    if console::Term::stdout().is_term() {
+        Ok(Input::new().with_prompt(prompt).interact_text()?)
+    } else {
+        anyhow::bail!("{prompt} prompt requires a terminal")
+    }
+}
+
+fn prompt_with_default<T>(prompt: &str, default: T) -> Result<T>
+where
+    T: Clone + std::fmt::Display + std::str::FromStr + Send + Sync + 'static,
+    <T as std::str::FromStr>::Err: std::fmt::Display + Send + Sync + 'static,
+{
+    if console::Term::stdout().is_term() {
+        Ok(Input::new()
+            .with_prompt(prompt)
+            .default(default)
+            .interact_text()?)
+    } else {
+        Ok(default)
+    }
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -1268,7 +1284,9 @@ mod tests {
         });
         let task = pipe.run();
         tokio::pin!(task);
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err());
         assert_eq!(remote.interactive_cancel_log(), vec![1]);
 
         let summary = task.await;

@@ -292,8 +292,30 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.register_key && self.key.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("register_key=true requires non-empty key");
+        }
+        if self.proxy.local_port == 0 {
+            anyhow::bail!("proxy.local_port must be > 0");
+        }
+        for file in &self.file {
+            validate_chmod(file.chmod.as_deref(), &file.src)?;
+        }
+        for block in &self.block {
+            if block.file.is_empty() {
+                anyhow::bail!("block '{}' has empty target file", block.name);
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_chmod(raw: Option<&str>, context: &str) -> Result<()> {
+    if let Some(value) = raw {
+        u32::from_str_radix(value, 8)
+            .map_err(|_| anyhow::anyhow!("invalid chmod '{value}' for '{context}'"))?;
+    }
+    Ok(())
 }
 
 fn resolve_keychain_value(spec: &str) -> Result<String, SecretError> {
@@ -472,5 +494,58 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, SecretError::NotFound("svc.acc".into()));
+    }
+
+    #[test]
+    fn validate_rejects_register_key_without_key() {
+        let config: Config = serde_yml::from_str("register_key: true\nhost: h\n").unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("register_key=true requires non-empty key"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_chmod() {
+        let config = Config {
+            version: 1,
+            imports: vec![],
+            host: Some("h".into()),
+            port: None,
+            user: None,
+            key: None,
+            password: None,
+            register_key: false,
+            interpreter: default_interpreter(),
+            flags: default_flags(),
+            comment_template: default_comment_template(),
+            flux_home: None,
+            proxy: ProxyConfig::default(),
+            file: vec![FileItem {
+                name: None,
+                src: "a".into(),
+                dst: ":/r/a".into(),
+                kind: ItemKind::File,
+                target: None,
+                mode: SyncMode::Sync,
+                chmod: Some("abc".into()),
+                tags: vec![],
+            }],
+            script: vec![],
+            block: vec![],
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_proxy_port() {
+        let config: Config =
+            serde_yml::from_str("host: h\nproxy:\n  enabled: true\n  local_port: 0\n").unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("proxy.local_port must be > 0"));
     }
 }

@@ -20,5 +20,14 @@ Schema v2 adds:
 - `file.kind` and `file.target`
 - additive `tags` support across items
 
+Validation tightened alongside v2 usage:
+- `register_key: true` now requires a non-empty `key`
+- `file.chmod` values must be valid octal strings
+- `proxy.local_port` must be greater than zero
+
+Env interpolation remains `${VAR}` / `${VAR:-default}` and now supports `$$`
+to emit a literal dollar sign, which is useful for YAML comments and examples.
+
 This remains backward compatible for v1 YAML: existing configs without these
-fields still load unchanged.
+fields still load unchanged, and configs without an explicit `version:` field
+still probe as schema v1.

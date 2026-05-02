@@ -227,7 +227,7 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
                 Ok(code) => ItemOutcome::Failed(Arc::new(ScriptError::ExitCode(code).into())),
                 Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
             };
-            if let Err(err) = with_retry(policy, || remote.remove_file(upload_to)).await {
+            if let Err(err) = remote.remove_file(upload_to).await {
                 reporter.warning(&format!(
                     "failed to remove remote temp script {upload_to}: {err}"
                 ));
@@ -379,15 +379,8 @@ mod tests {
             .collect::<HashMap<_, _>>(),
             last_failed_item: None,
         };
-        let actions = plan_scripts(
-            &[script],
-            tmp.path(),
-            "/bin/bash",
-            &[],
-            Some(&state),
-            true,
-        )
-        .await;
+        let actions =
+            plan_scripts(&[script], tmp.path(), "/bin/bash", &[], Some(&state), true).await;
         assert!(matches!(
             &actions[0],
             ScriptAction::Skip {
@@ -433,7 +426,9 @@ mod tests {
         );
         tokio::pin!(task);
 
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err());
         assert_eq!(remote.interactive_cancel_log(), vec![1]);
 
         let outcome = task.await;

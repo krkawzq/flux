@@ -680,7 +680,7 @@ fn expand_tilde(path: &str) -> String {
 }
 
 /// Escape shell special characters
-fn shell_escape(s: &str) -> String {
+pub fn shell_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {

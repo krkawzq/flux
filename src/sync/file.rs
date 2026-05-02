@@ -6,12 +6,13 @@ use crate::path::FluxPath;
 use crate::remote::{with_retry, ExecOutput, RemoteOps, RemoteOpsError, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{FileAction, SkipReason};
-use chrono::Utc;
 use globset::Glob;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub enum FileError {
     InvalidPath(String),
     #[error("only local->remote sync is supported (got src={src} dst={dst})")]
     UnsupportedDirection { src: String, dst: String },
+    #[error("invalid chmod '{0}'; expected octal like 600 or 755")]
+    InvalidChmod(String),
 }
 
 pub async fn plan_files<R: RemoteOps + ?Sized>(items: &[FileItem], remote: &R) -> Vec<FileAction> {
@@ -111,14 +114,20 @@ async fn plan_single_file<R: RemoteOps + ?Sized>(
 ) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let mode = item.mode.clone();
-    let chmod = item
-        .chmod
-        .as_deref()
-        .and_then(|value| u32::from_str_radix(value, 8).ok());
+    let chmod = match parse_chmod(item.chmod.as_deref()) {
+        Ok(chmod) => chmod,
+        Err(error) => {
+            return FileAction::Failed {
+                item_name,
+                error: error.into(),
+            };
+        }
+    };
     match resolve_local_remote(&item.src, &item.dst) {
         Ok((local_path, remote_path)) => {
             if use_cache {
-                if let Some(hash) = regular_file_cache_key(&local_path, &remote_path, &mode, chmod) {
+                if let Some(hash) = regular_file_cache_key(&local_path, &remote_path, &mode, chmod)
+                {
                     if state
                         .and_then(|state| state.item_hashes.get(&item_name))
                         .is_some_and(|cached| cached == &hash)
@@ -195,10 +204,15 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
         }
     };
     let root = glob_search_root(&local_pattern);
-    let chmod = item
-        .chmod
-        .as_deref()
-        .and_then(|value| u32::from_str_radix(value, 8).ok());
+    let chmod = match parse_chmod(item.chmod.as_deref()) {
+        Ok(chmod) => chmod,
+        Err(error) => {
+            return vec![FileAction::Failed {
+                item_name,
+                error: error.into(),
+            }];
+        }
+    };
 
     let mut actions = Vec::new();
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
@@ -262,10 +276,15 @@ async fn plan_glob<R: RemoteOps + ?Sized>(
 fn plan_dir(item: &FileItem, state: Option<&HostState>, use_cache: bool) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let mode = item.mode.clone();
-    let chmod = item
-        .chmod
-        .as_deref()
-        .and_then(|value| u32::from_str_radix(value, 8).ok());
+    let chmod = match parse_chmod(item.chmod.as_deref()) {
+        Ok(chmod) => chmod,
+        Err(error) => {
+            return FileAction::Failed {
+                item_name,
+                error: error.into(),
+            };
+        }
+    };
     let (src_dir, dst_dir) = match resolve_local_remote(&item.src, &item.dst) {
         Ok(paths) => paths,
         Err(error) => {
@@ -400,7 +419,8 @@ pub fn collect_item_hashes(items: &[FileItem]) -> HashMap<String, String> {
                 let name = item.name.clone().unwrap_or_else(|| item.src.clone());
                 let src = FluxPath::parse(&item.src);
                 let dst = FluxPath::parse(&item.dst);
-                if let (FluxPath::Local(local_pattern), FluxPath::Remote(remote_base)) = (src, dst) {
+                if let (FluxPath::Local(local_pattern), FluxPath::Remote(remote_base)) = (src, dst)
+                {
                     if let Ok(glob) = Glob::new(&local_pattern.to_string_lossy()) {
                         let matcher = glob.compile_matcher();
                         let root = glob_search_root(&local_pattern);
@@ -665,7 +685,7 @@ async fn apply_file_path<R: RemoteOps + ?Sized>(
         with_retry(policy, || remote.ensure_dir(parent)).await?;
     }
     let bytes = read_local_bytes(src).map_err(|err| RemoteOpsError::Io(err.to_string()))?;
-    let tmp = format!("{dst}.flux.tmp.{}", std::process::id());
+    let tmp = unique_tmp_path(dst);
     with_retry(policy, || remote.write_file(&tmp, &bytes)).await?;
     if let Some(mode) = chmod {
         let current_mode = with_retry(policy, || remote.stat_mode(&tmp)).await.ok();
@@ -674,11 +694,11 @@ async fn apply_file_path<R: RemoteOps + ?Sized>(
         }
     }
     if with_retry(policy, || remote.exists(dst)).await? {
-        let backup = format!("{dst}.flux-{}.bak", Utc::now().timestamp());
-        with_retry(policy, || remote.rename(dst, &backup)).await?;
+        let backup = unique_backup_path(dst);
+        remote.rename(dst, &backup).await?;
         rotate_backups(remote, dst, 3, policy).await?;
     }
-    with_retry(policy, || remote.rename(&tmp, dst)).await?;
+    remote.rename(&tmp, dst).await?;
     Ok(())
 }
 
@@ -707,6 +727,13 @@ async fn apply_link<R: RemoteOps + ?Sized>(
     let command = format!("ln -sfn {} {}", shell_escape(target), shell_escape(dst));
     let out = with_retry(policy, || remote.exec(&command)).await?;
     ensure_success(&out)
+}
+
+fn parse_chmod(raw: Option<&str>) -> Result<Option<u32>, FileError> {
+    raw.map(|value| {
+        u32::from_str_radix(value, 8).map_err(|_| FileError::InvalidChmod(value.to_string()))
+    })
+    .transpose()
 }
 
 fn action_name(action: &FileAction) -> String {
@@ -794,15 +821,26 @@ fn regular_file_cache_key(
     update_cache_key(&mut hasher, &bytes);
     update_cache_key(&mut hasher, dst);
     update_cache_key(&mut hasher, mode_key(mode));
-    update_cache_key(&mut hasher, chmod.map(|value| format!("{value:o}")).unwrap_or_default());
+    update_cache_key(
+        &mut hasher,
+        chmod.map(|value| format!("{value:o}")).unwrap_or_default(),
+    );
     Some(hash_hex(&hasher.finalize()))
 }
 
-fn dir_cache_key(files: &[(PathBuf, String)], dst_dir: &str, mode: &SyncMode, chmod: Option<u32>) -> String {
+fn dir_cache_key(
+    files: &[(PathBuf, String)],
+    dst_dir: &str,
+    mode: &SyncMode,
+    chmod: Option<u32>,
+) -> String {
     let mut hasher = Sha256::new();
     update_cache_key(&mut hasher, dst_dir);
     update_cache_key(&mut hasher, mode_key(mode));
-    update_cache_key(&mut hasher, chmod.map(|value| format!("{value:o}")).unwrap_or_default());
+    update_cache_key(
+        &mut hasher,
+        chmod.map(|value| format!("{value:o}")).unwrap_or_default(),
+    );
     for (path, relative) in files {
         update_cache_key(&mut hasher, relative);
         if let Ok(bytes) = std::fs::read(path) {
@@ -839,19 +877,22 @@ async fn rotate_backups<R: RemoteOps + ?Sized>(
 ) -> Result<(), RemoteOpsError> {
     let quoted_dst = shell_escape(dst);
     let pattern = format!("\"$(dirname {quoted_dst})/$(basename {quoted_dst})\".flux-*.bak");
-    let command = format!(
-        "ls -1 {pattern} 2>/dev/null | sort -t- -k2,2nr | tail -n +{}",
-        keep + 1
-    );
+    let command = format!("ls -1 {pattern} 2>/dev/null || true");
     let out = with_retry(policy, || remote.exec(&command)).await?;
     ensure_success(&out)?;
-    for backup in out
+    let mut backups = out
         .stdout_string()
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-    {
-        with_retry(policy, || remote.remove_file(backup)).await?;
+        .filter_map(|line| backup_timestamp(line).map(|ts| (line.to_string(), ts)))
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+    for (backup, _) in backups.into_iter().skip(keep) {
+        match remote.remove_file(&backup).await {
+            Ok(()) | Err(RemoteOpsError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(())
 }
@@ -879,6 +920,52 @@ fn shell_escape(input: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+fn backup_timestamp(path: &str) -> Option<u128> {
+    let marker = ".flux-";
+    let start = path.rfind(marker)? + marker.len();
+    let end = path[start..].find(".bak")? + start;
+    path[start..end].parse().ok()
+}
+
+fn unique_tmp_path(dst: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst) % 1_000_000;
+    let nanos = unix_nanos();
+    format!(
+        "{dst}.flux.tmp.{}.{}.{counter:06}",
+        std::process::id(),
+        nanos
+    )
+}
+
+fn unique_backup_path(dst: &str) -> String {
+    format!("{dst}.flux-{}.bak", unique_nanos())
+}
+
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn unique_nanos() -> u128 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut current = unix_nanos() as u64;
+    loop {
+        let last = LAST.load(Ordering::SeqCst);
+        if current <= last {
+            current = last + 1;
+        }
+        if LAST
+            .compare_exchange(last, current, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return u128::from(current);
+        }
+    }
 }
 
 fn contains_glob_meta(path: &str) -> bool {
@@ -1213,7 +1300,7 @@ mod tests {
         remote.add_exec_rule(crate::remote::fake::ExecRule {
             matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
             status: 0,
-            stdout: b"/r/a.txt.flux-2.bak\n/r/a.txt.flux-1.bak\n".to_vec(),
+            stdout: b"/r/a.txt.flux-2.bak\n/r/a.txt.flux-1.bak\n/r/a.txt.flux-5.bak\n/r/a.txt.flux-4.bak\n/r/a.txt.flux-3.bak\n".to_vec(),
             stderr: vec![],
         });
         for ts in 1..=5 {
@@ -1260,7 +1347,9 @@ mod tests {
         let state = HostState {
             host: "h".into(),
             last_sync_ts: 0,
-            item_hashes: collect_item_hashes(&[old_item]).into_iter().collect::<HashMap<_, _>>(),
+            item_hashes: collect_item_hashes(&[old_item])
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
             last_failed_item: None,
         };
         let remote = InMemoryRemote::new();
@@ -1287,7 +1376,9 @@ mod tests {
         let state = HostState {
             host: "h".into(),
             last_sync_ts: 0,
-            item_hashes: collect_item_hashes(&[old_item]).into_iter().collect::<HashMap<_, _>>(),
+            item_hashes: collect_item_hashes(&[old_item])
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
             last_failed_item: None,
         };
         let remote = InMemoryRemote::new();
@@ -1300,7 +1391,13 @@ mod tests {
             true,
         )
         .await;
-        assert!(matches!(&actions[0], FileAction::Apply { chmod: Some(0o644), .. }));
+        assert!(matches!(
+            &actions[0],
+            FileAction::Apply {
+                chmod: Some(0o644),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1312,6 +1409,80 @@ mod tests {
         remote.write_file("/r/a.txt", b"external").await.unwrap();
         let reporter = CapturedReporter::new();
         let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
-        assert!(matches!(outcome, ItemOutcome::Skipped(SkipReason::RemoteNewer)));
+        assert!(matches!(
+            outcome,
+            ItemOutcome::Skipped(SkipReason::RemoteNewer)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_chmod_returns_failed_action() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let mut bad = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        bad.chmod = Some("oops".into());
+        let remote = InMemoryRemote::new();
+        let actions = plan_files(&[bad], &remote).await;
+        assert!(matches!(&actions[0], FileAction::Failed { .. }));
+    }
+
+    #[test]
+    fn unique_tmp_and_backup_names_include_high_resolution_entropy() {
+        let tmp1 = unique_tmp_path("/r/a.txt");
+        let tmp2 = unique_tmp_path("/r/a.txt");
+        let backup1 = unique_backup_path("/r/a.txt");
+        let backup2 = unique_backup_path("/r/a.txt");
+        assert_ne!(tmp1, tmp2);
+        assert_ne!(backup1, backup2);
+        assert!(tmp1.starts_with("/r/a.txt.flux.tmp."));
+        assert!(backup1.starts_with("/r/a.txt.flux-"));
+        assert!(backup1.ends_with(".bak"));
+    }
+
+    #[tokio::test]
+    async fn rotate_backups_parses_timestamp_not_path_hyphen_order() {
+        let remote = InMemoryRemote::new();
+        remote.add_exec_rule(crate::remote::fake::ExecRule {
+            matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
+            status: 0,
+            stdout: b"/r/my-host/a.txt.flux-10.bak\n/r/my-host/a.txt.flux-2.bak\n/r/my-host/a.txt.flux-30.bak\n".to_vec(),
+            stderr: vec![],
+        });
+        for ts in [2, 10, 30] {
+            remote
+                .write_file(&format!("/r/my-host/a.txt.flux-{ts}.bak"), b"x")
+                .await
+                .unwrap();
+        }
+        rotate_backups(&remote, "/r/my-host/a.txt", 1, RetryPolicy::no_retry())
+            .await
+            .unwrap();
+        assert!(remote
+            .file_contents("/r/my-host/a.txt.flux-30.bak")
+            .is_some());
+        assert!(remote
+            .file_contents("/r/my-host/a.txt.flux-10.bak")
+            .is_none());
+        assert!(remote
+            .file_contents("/r/my-host/a.txt.flux-2.bak")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_is_not_retried() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"new");
+        let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
+        remote.add_exec_rule(crate::remote::fake::ExecRule {
+            matcher: Box::new(|cmd| cmd.starts_with("ls -1 ")),
+            status: 0,
+            stdout: vec![],
+            stderr: vec![],
+        });
+        remote.fail_next("rename", RemoteOpsError::Transport("rename flake".into()));
+        let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Cover)], &remote).await;
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::default()).await;
+        assert!(matches!(outcome, ItemOutcome::Failed(_)));
     }
 }

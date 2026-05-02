@@ -509,23 +509,15 @@ fn shell_quote(input: &str) -> String {
 fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
     let host = match &config.host {
         Some(host) if !host.is_empty() => host.clone(),
-        _ => dialoguer::Input::new()
-            .with_prompt("Host")
-            .interact_text()?,
+        _ => prompt_required("Host")?,
     };
     let port = match config.port {
         Some(port) if port > 0 => port,
-        _ => dialoguer::Input::new()
-            .with_prompt("Port")
-            .default(22u16)
-            .interact_text()?,
+        _ => prompt_with_default("Port", 22u16)?,
     };
     let user = match &config.user {
         Some(user) if !user.is_empty() => user.clone(),
-        _ => dialoguer::Input::new()
-            .with_prompt("User")
-            .default("root".to_string())
-            .interact_text()?,
+        _ => prompt_with_default("User", "root".to_string())?,
     };
     let key_path = config.key.clone();
     let password = resolve_password(config.password.as_ref(), key_path.as_ref())?;
@@ -536,6 +528,31 @@ fn resolve_ssh_config(config: &Config) -> Result<SshConfig> {
         key_path,
         password,
     })
+}
+
+fn prompt_required(prompt: &str) -> Result<String> {
+    if console::Term::stdout().is_term() {
+        Ok(dialoguer::Input::new()
+            .with_prompt(prompt)
+            .interact_text()?)
+    } else {
+        anyhow::bail!("{prompt} prompt requires a terminal")
+    }
+}
+
+fn prompt_with_default<T>(prompt: &str, default: T) -> Result<T>
+where
+    T: Clone + std::fmt::Display + std::str::FromStr + Send + Sync + 'static,
+    <T as std::str::FromStr>::Err: std::fmt::Display + Send + Sync + 'static,
+{
+    if console::Term::stdout().is_term() {
+        Ok(dialoguer::Input::new()
+            .with_prompt(prompt)
+            .default(default)
+            .interact_text()?)
+    } else {
+        Ok(default)
+    }
 }
 
 fn resolve_config_paths(config: &mut Config, asset_root: &Path) {
@@ -716,5 +733,13 @@ mod tests {
         save_host_state(&config, dir.path(), "example", &summary);
 
         assert_eq!(load("example"), Some(existing));
+    }
+
+    #[test]
+    fn prompt_with_default_returns_default_without_tty() {
+        if !console::Term::stdout().is_term() {
+            let value = prompt_with_default("Port", 22u16).unwrap();
+            assert_eq!(value, 22);
+        }
     }
 }

@@ -70,3 +70,35 @@ path = "tests/proptests/block_sentinel.rs"
 [[test]]
 name = "pipeline_file"
 path = "tests/integration/pipeline_file.rs"
+
+[[test]]
+name = "pipeline_block"
+path = "tests/integration/pipeline_block.rs"
+
+[[test]]
+name = "pipeline_dry_run"
+path = "tests/integration/pipeline_dry_run.rs"
+
+[[test]]
+name = "pipeline_resume"
+path = "tests/integration/pipeline_resume.rs"
+
+[[test]]
+name = "pipeline_multi_host"
+path = "tests/integration/pipeline_multi_host.rs"
+
+[[test]]
+name = "pipeline_filter"
+path = "tests/integration/pipeline_filter.rs"
+
+[[test]]
+name = "shell_escape_proptests"
+path = "tests/proptests/shell_escape.rs"
+
+[[test]]
+name = "env_interpolation_proptests"
+path = "tests/proptests/env_interpolation.rs"
+
+[[test]]
+name = "cache_key_proptests"
+path = "tests/proptests/cache_key.rs"

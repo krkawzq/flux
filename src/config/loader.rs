@@ -46,7 +46,10 @@ pub fn interpolate(raw: &str) -> Result<String, LoaderError> {
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'$') {
+            out.push('$');
+            i += 2;
+        } else if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
             i += 2;
             let start = i;
             while i < chars.len() && chars[i] != '}' {
@@ -207,6 +210,12 @@ mod tests {
         let value: Value = serde_yml::from_str(&interpolated).unwrap();
         assert_eq!(value["host"], Value::String("value".into()));
         std::env::remove_var("FLUX_QUOTED_TEST");
+    }
+
+    #[test]
+    fn interpolate_supports_dollar_escape() {
+        assert_eq!(interpolate("a $$VAR b").unwrap(), "a $VAR b");
+        assert_eq!(interpolate("# $${VAR}").unwrap(), "# ${VAR}");
     }
 
     #[test]

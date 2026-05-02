@@ -295,7 +295,9 @@ impl RemoteOps for InMemoryRemote {
                 let mut guard = self.inner.lock().unwrap();
                 guard.interactive_cancel_log.push(seen);
                 if seen >= 2 {
-                    return Err(RemoteOpsError::Transport("interactive exec cancelled".into()));
+                    return Err(RemoteOpsError::Transport(
+                        "interactive exec cancelled".into(),
+                    ));
                 }
             }
         }

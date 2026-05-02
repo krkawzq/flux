@@ -7,8 +7,9 @@ use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{FileAction, SkipReason};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum FileError {
     #[error("source not found: {0}")]
     SourceNotFound(String),
@@ -24,11 +25,27 @@ pub enum FileError {
 
 /// Compute file actions without touching the remote write surface.
 pub async fn plan_files<R: RemoteOps + ?Sized>(items: &[FileItem], remote: &R) -> Vec<FileAction> {
-    let mut actions = Vec::with_capacity(items.len());
-    for item in items {
-        actions.push(plan_one_file(item, remote).await);
+    plan_files_with_concurrency(items, remote, 1).await
+}
+
+pub async fn plan_files_with_concurrency<R: RemoteOps + ?Sized>(
+    items: &[FileItem],
+    remote: &R,
+    max_concurrency: usize,
+) -> Vec<FileAction> {
+    use futures::stream::{self, StreamExt};
+
+    let indexed: Vec<(usize, &FileItem)> = items.iter().enumerate().collect();
+    let mut results: Vec<Option<FileAction>> = (0..items.len()).map(|_| None).collect();
+    let mut stream = stream::iter(indexed)
+        .map(|(idx, item)| async move { (idx, plan_one_file(item, remote).await) })
+        .buffer_unordered(max_concurrency.max(1));
+
+    while let Some((idx, action)) = stream.next().await {
+        results[idx] = Some(action);
     }
-    actions
+
+    results.into_iter().map(|result| result.unwrap()).collect()
 }
 
 async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> FileAction {
@@ -192,21 +209,33 @@ pub async fn execute_file<R: RemoteOps + ?Sized>(
     reporter.item_started(Stage::File, &name);
     let outcome = match action {
         FileAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
-        FileAction::Failed { error, .. } => ItemOutcome::Failed(error.to_string()),
+        FileAction::Failed { error, .. } => ItemOutcome::Failed(Arc::new(error.clone())),
         FileAction::Apply {
             dst, bytes, chmod, ..
         } => {
             if let Some(parent) = parent_dir(dst) {
                 if let Err(err) = remote.ensure_dir(parent).await {
-                    return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                    return finish(
+                        reporter,
+                        &name,
+                        ItemOutcome::Failed(Arc::new(err.into())),
+                    );
                 }
             }
             if let Err(err) = remote.write_file(dst, bytes).await {
-                return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                return finish(
+                    reporter,
+                    &name,
+                    ItemOutcome::Failed(Arc::new(err.into())),
+                );
             }
             if let Some(mode) = chmod {
                 if let Err(err) = remote.chmod(dst, *mode).await {
-                    return finish(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                    return finish(
+                        reporter,
+                        &name,
+                        ItemOutcome::Failed(Arc::new(err.into())),
+                    );
                 }
             }
             ItemOutcome::Applied

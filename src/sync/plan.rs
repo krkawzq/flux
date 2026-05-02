@@ -10,7 +10,6 @@ pub enum SkipReason {
     AlreadyExists,
     RemoteNewer,
     ContentUnchanged,
-    DependencyFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

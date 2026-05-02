@@ -6,7 +6,6 @@ pub mod version;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Root configuration structure
@@ -148,9 +147,6 @@ pub struct ScriptItem {
     /// Script arguments
     #[serde(default)]
     pub args: Vec<String>,
-    /// File dependencies (by name)
-    #[serde(default)]
-    pub dependencies: Vec<String>,
 }
 
 /// Block sync item
@@ -253,24 +249,6 @@ impl Config {
 
     /// Validate cross-reference integrity inside the loaded config.
     pub fn validate(&self) -> Result<()> {
-        let file_names: HashSet<&str> = self
-            .file
-            .iter()
-            .filter_map(|item| item.name.as_deref())
-            .collect();
-
-        for script in &self.script {
-            for dependency in &script.dependencies {
-                if !file_names.contains(dependency.as_str()) {
-                    anyhow::bail!(
-                        "script '{}' references unknown dependency '{}'",
-                        script.path,
-                        dependency
-                    );
-                }
-            }
-        }
-
         Ok(())
     }
 }

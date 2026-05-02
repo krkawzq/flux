@@ -19,8 +19,9 @@ use dialoguer::{Input, Password};
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum SyncError {
     #[error("file: {0}")]
     File(#[from] file::FileError),
@@ -66,29 +67,22 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 .unwrap_or_default(),
             remote_authorized_keys: "~/.ssh/authorized_keys".into(),
         });
-        let file_actions = file::plan_files(&self.config.file, self.remote).await;
-        let file_status: HashMap<String, bool> = file_actions
-            .iter()
-            .map(|action| match action {
-                FileAction::Apply { item_name, .. } | FileAction::Skip { item_name, .. } => {
-                    (item_name.clone(), true)
-                }
-                FileAction::Failed { item_name, .. } => (item_name.clone(), false),
-            })
-            .collect();
+        let file_actions =
+            file::plan_files_with_concurrency(&self.config.file, self.remote, self.opts.max_concurrency)
+                .await;
         let script_actions = script::plan_scripts(
             &self.config.script,
-            &file_status,
             self.asset_root,
             &self.config.interpreter,
             self.config.flags.as_slice(),
         )
         .await;
-        let block_actions = block::plan_blocks(
+        let block_actions = block::plan_blocks_with_concurrency(
             &self.config.block,
             self.asset_root,
             &self.config.comment_template,
             self.remote,
+            self.opts.max_concurrency,
         )
         .await;
         Plan {
@@ -224,7 +218,7 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
 
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(err) => ItemOutcome::Failed(err.to_string()),
+            Err(err) => ItemOutcome::Failed(Arc::new(err)),
         };
         self.reporter
             .item_finished(Stage::Pubkey, "register_pubkey", &outcome);

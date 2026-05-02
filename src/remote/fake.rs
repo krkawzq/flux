@@ -143,12 +143,31 @@ impl RemoteOps for InMemoryRemote {
             .ok_or_else(|| RemoteOpsError::NotFound(path.to_string()))
     }
 
+    async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError> {
+        let guard = self.inner.lock().unwrap();
+        if let Some(mode) = guard.modes.get(path).copied() {
+            return Ok(mode);
+        }
+        if guard.files.contains_key(path) {
+            return Ok(0o644);
+        }
+        Err(RemoteOpsError::NotFound(path.to_string()))
+    }
+
     async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
         if !guard.files.contains_key(path) && !guard.dirs.contains(path) {
             return Err(RemoteOpsError::NotFound(path.to_string()));
         }
         guard.modes.insert(path.to_string(), mode);
+        Ok(())
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.files.remove(path);
+        guard.mtimes.remove(path);
+        guard.modes.remove(path);
         Ok(())
     }
 
@@ -198,6 +217,32 @@ mod tests {
         remote.write_file("/a", b"x").await.unwrap();
         remote.chmod("/a", 0o600).await.unwrap();
         assert_eq!(remote.file_mode("/a"), Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn stat_mode_returns_chmod_value() {
+        let remote = InMemoryRemote::new();
+        remote.write_file("/a", b"x").await.unwrap();
+        remote.chmod("/a", 0o600).await.unwrap();
+        assert_eq!(remote.stat_mode("/a").await.unwrap(), 0o600);
+    }
+
+    #[tokio::test]
+    async fn stat_mode_default_for_unchmoded() {
+        let remote = InMemoryRemote::new();
+        remote.write_file("/a", b"x").await.unwrap();
+        assert_eq!(remote.stat_mode("/a").await.unwrap(), 0o644);
+    }
+
+    #[tokio::test]
+    async fn remove_file_drops_entry() {
+        let remote = InMemoryRemote::new();
+        remote.write_file("/a", b"x").await.unwrap();
+        remote.remove_file("/a").await.unwrap();
+        assert!(matches!(
+            remote.read_file("/a").await.unwrap_err(),
+            RemoteOpsError::NotFound(_)
+        ));
     }
 
     #[tokio::test]

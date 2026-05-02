@@ -4,7 +4,9 @@
 pub mod console;
 pub mod memory;
 
+use crate::sync::SyncError;
 use crate::sync::plan::{Plan, SkipReason};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -18,7 +20,16 @@ pub enum Stage {
 pub enum ItemOutcome {
     Applied,
     Skipped(SkipReason),
-    Failed(String),
+    Failed(Arc<SyncError>),
+}
+
+impl ItemOutcome {
+    pub fn failed_message(&self) -> Option<String> {
+        match self {
+            Self::Failed(error) => Some(error.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

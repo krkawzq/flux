@@ -593,10 +593,41 @@ impl RemoteOps for SshClient {
             .ok_or_else(|| RemoteOpsError::Encoding(format!("invalid mtime {secs}")))
     }
 
+    async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError> {
+        let cmd = format!(
+            "stat -c %a {0} 2>/dev/null || stat -f %Lp {0}",
+            shell_escape(path)
+        );
+        let out = self.exec_command(&cmd).await.map_err(map_anyhow)?;
+        if out.exit_code != 0 {
+            return Err(RemoteOpsError::NonZeroExit {
+                status: out.exit_code as i32,
+                stderr: out.stderr,
+            });
+        }
+        let trimmed = out.stdout.trim();
+        u32::from_str_radix(trimmed, 8)
+            .map_err(|e| RemoteOpsError::Encoding(format!("stat_mode parse '{trimmed}': {e}")))
+    }
+
     async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError> {
         self.chmod_remote(path, &format!("{mode:o}"))
             .await
             .map_err(map_anyhow)
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
+        let out = self
+            .exec_command(&format!("rm -f {}", shell_escape(path)))
+            .await
+            .map_err(map_anyhow)?;
+        if out.exit_code != 0 {
+            return Err(RemoteOpsError::NonZeroExit {
+                status: out.exit_code as i32,
+                stderr: out.stderr,
+            });
+        }
+        Ok(())
     }
 
     async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError> {

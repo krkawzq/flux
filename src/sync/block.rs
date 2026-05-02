@@ -8,8 +8,9 @@ use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum BlockError {
     #[error("comment template missing {{}} placeholder")]
     BadTemplate,
@@ -102,11 +103,29 @@ pub async fn plan_blocks<R: RemoteOps + ?Sized>(
     template: &str,
     remote: &R,
 ) -> Vec<BlockAction> {
-    let mut actions = Vec::with_capacity(items.len());
-    for item in items {
-        actions.push(plan_one_block(item, asset_root, template, remote).await);
+    plan_blocks_with_concurrency(items, asset_root, template, remote, 1).await
+}
+
+pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
+    items: &[BlockItem],
+    asset_root: &Path,
+    template: &str,
+    remote: &R,
+    max_concurrency: usize,
+) -> Vec<BlockAction> {
+    use futures::stream::{self, StreamExt};
+
+    let indexed: Vec<(usize, &BlockItem)> = items.iter().enumerate().collect();
+    let mut results: Vec<Option<BlockAction>> = (0..items.len()).map(|_| None).collect();
+    let mut stream = stream::iter(indexed)
+        .map(|(idx, item)| async move { (idx, plan_one_block(item, asset_root, template, remote).await) })
+        .buffer_unordered(max_concurrency.max(1));
+
+    while let Some((idx, action)) = stream.next().await {
+        results[idx] = Some(action);
     }
-    actions
+
+    results.into_iter().map(|result| result.unwrap()).collect()
 }
 
 async fn plan_one_block<R: RemoteOps + ?Sized>(
@@ -153,7 +172,10 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
             };
         }
     };
-    let timestamp = Utc::now().timestamp();
+    let timestamp = std::fs::metadata(&local_path)
+        .and_then(|m| m.modified())
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
     let chosen_template = item.comment_template.as_deref().unwrap_or(template);
     let (open_marker, close_marker) = match build_markers(chosen_template, &item_name, timestamp) {
         Ok(markers) => markers,
@@ -270,7 +292,7 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
     reporter.item_started(Stage::Block, &name);
     let outcome = match action {
         BlockAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
-        BlockAction::Failed { error, .. } => ItemOutcome::Failed(error.to_string()),
+        BlockAction::Failed { error, .. } => ItemOutcome::Failed(Arc::new(error.clone())),
         BlockAction::Apply {
             target,
             body,
@@ -281,20 +303,28 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
                 Ok(true) => match remote.read_file(target).await {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                     Err(err) => {
-                        return finish_block(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                        return finish_block(
+                            reporter,
+                            &name,
+                            ItemOutcome::Failed(Arc::new(err.into())),
+                        );
                     }
                 },
                 Ok(false) => String::new(),
                 Err(err) => {
-                    return finish_block(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                    return finish_block(
+                        reporter,
+                        &name,
+                        ItemOutcome::Failed(Arc::new(err.into())),
+                    );
                 }
             };
             match compose(&current, body, sentinel, template, &name) {
                 Ok(content) => match remote.write_file(target, content.as_bytes()).await {
                     Ok(()) => ItemOutcome::Applied,
-                    Err(err) => ItemOutcome::Failed(err.to_string()),
+                    Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
                 },
-                Err(err) => ItemOutcome::Failed(err.to_string()),
+                Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
             }
         }
     };
@@ -359,6 +389,10 @@ fn action_name(action: &BlockAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BlockItem, SyncMode};
+    use crate::remote::fake::InMemoryRemote;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn build_markers_basic() {
@@ -446,5 +480,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, "x\n# >>> n:2 >>>\nnew body\n# <<< n:2 <<<\ny\n");
+    }
+
+    #[tokio::test]
+    async fn block_plan_is_idempotent_across_runs() {
+        let tmp = TempDir::new().unwrap();
+        let block_path = tmp.path().join("aliases.sh");
+        std::fs::write(&block_path, b"alias x='1'\n").unwrap();
+        let remote = InMemoryRemote::new();
+        let item = BlockItem {
+            name: "aliases".into(),
+            path: "aliases.sh".into(),
+            file: ":/remote/.bashrc".into(),
+            mode: SyncMode::Sync,
+            comment_template: None,
+        };
+
+        let actions1 = plan_blocks_with_concurrency(
+            &[item.clone()],
+            tmp.path(),
+            "# {}",
+            &remote,
+            1,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let actions2 = plan_blocks_with_concurrency(&[item], tmp.path(), "# {}", &remote, 1).await;
+
+        let ts1 = match &actions1[0] {
+            BlockAction::Apply { sentinel, .. } => sentinel.timestamp,
+            _ => panic!("expected apply"),
+        };
+        let ts2 = match &actions2[0] {
+            BlockAction::Apply { sentinel, .. } => sentinel.timestamp,
+            _ => panic!("expected apply"),
+        };
+        assert_eq!(ts1, ts2);
     }
 }

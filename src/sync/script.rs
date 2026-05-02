@@ -3,18 +3,18 @@
 use crate::config::ScriptItem;
 use crate::remote::RemoteOps;
 use crate::reporter::{ItemOutcome, Reporter, Stage};
-use crate::sync::plan::{ScriptAction, SkipReason};
-use std::collections::HashMap;
+use crate::sync::plan::ScriptAction;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ScriptError {
     #[error("script source not found: {0}")]
     SourceNotFound(String),
     #[error("local io: {0}")]
     LocalIo(String),
-    #[error("internal: dependency {0} not validated; this is a bug")]
-    UnvalidatedDependency(String),
+    #[error("script exited with code {0}")]
+    ExitCode(i32),
 }
 
 /// Quote a string for safe inclusion in a `/bin/sh` command.
@@ -34,7 +34,6 @@ pub fn shell_quote(input: &str) -> String {
 
 pub async fn plan_scripts(
     items: &[ScriptItem],
-    file_status: &HashMap<String, bool>,
     asset_root: &Path,
     default_interpreter: &str,
     default_flags: &[String],
@@ -43,7 +42,6 @@ pub async fn plan_scripts(
     for item in items {
         actions.push(plan_one_script(
             item,
-            file_status,
             asset_root,
             default_interpreter,
             default_flags,
@@ -54,30 +52,11 @@ pub async fn plan_scripts(
 
 fn plan_one_script(
     item: &ScriptItem,
-    file_status: &HashMap<String, bool>,
     asset_root: &Path,
     default_interpreter: &str,
     default_flags: &[String],
 ) -> ScriptAction {
     let item_name = item.path.clone();
-
-    for dep in &item.dependencies {
-        match file_status.get(dep) {
-            Some(true) => {}
-            Some(false) => {
-                return ScriptAction::Skip {
-                    item_name,
-                    reason: SkipReason::DependencyFailed(dep.clone()),
-                };
-            }
-            None => {
-                return ScriptAction::Failed {
-                    item_name,
-                    error: ScriptError::UnvalidatedDependency(dep.clone()).into(),
-                };
-            }
-        }
-    }
 
     let local_path = resolve_script_path(asset_root, &item.path);
     let bytes = match std::fs::read(&local_path) {
@@ -129,7 +108,7 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
     reporter.item_started(Stage::Script, &name);
     let outcome = match action {
         ScriptAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
-        ScriptAction::Failed { error, .. } => ItemOutcome::Failed(error.to_string()),
+        ScriptAction::Failed { error, .. } => ItemOutcome::Failed(Arc::new(error.clone())),
         ScriptAction::Run {
             upload_to,
             local_script_bytes,
@@ -137,10 +116,18 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
             ..
         } => {
             if let Err(err) = remote.write_file(upload_to, local_script_bytes).await {
-                return finish_script(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                return finish_script(
+                    reporter,
+                    &name,
+                    ItemOutcome::Failed(Arc::new(err.into())),
+                );
             }
             if let Err(err) = remote.chmod(upload_to, 0o755).await {
-                return finish_script(reporter, &name, ItemOutcome::Failed(err.to_string()));
+                return finish_script(
+                    reporter,
+                    &name,
+                    ItemOutcome::Failed(Arc::new(err.into())),
+                );
             }
             let command = command_argv
                 .iter()
@@ -149,8 +136,8 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
                 .join(" ");
             match remote.interactive_exec(&command).await {
                 Ok(0) => ItemOutcome::Applied,
-                Ok(code) => ItemOutcome::Failed(format!("exit code {code}")),
-                Err(err) => ItemOutcome::Failed(err.to_string()),
+                Ok(code) => ItemOutcome::Failed(Arc::new(ScriptError::ExitCode(code).into())),
+                Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
             }
         }
     };
@@ -186,13 +173,12 @@ mod tests {
     use crate::reporter::memory::CapturedReporter;
     use tempfile::TempDir;
 
-    fn item(_name: &str, path: &str, deps: &[&str]) -> ScriptItem {
+    fn item(_name: &str, path: &str) -> ScriptItem {
         ScriptItem {
             path: path.into(),
             args: vec![],
             interpreter: None,
             flags: None,
-            dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
         }
     }
 
@@ -204,55 +190,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dependency_failed_skips() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
-        let mut deps = HashMap::new();
-        deps.insert("dep1".to_string(), false);
-        let actions = plan_scripts(
-            &[item("s", "s.sh", &["dep1"])],
-            &deps,
-            tmp.path(),
-            "/bin/bash",
-            &[],
-        )
-        .await;
-        assert!(matches!(
-            &actions[0],
-            ScriptAction::Skip {
-                reason: SkipReason::DependencyFailed(dep),
-                ..
-            } if dep == "dep1"
-        ));
-    }
-
-    #[tokio::test]
-    async fn unknown_dependency_is_failed_action() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh").unwrap();
-        let actions = plan_scripts(
-            &[item("s", "s.sh", &["never-validated"])],
-            &HashMap::new(),
-            tmp.path(),
-            "/bin/bash",
-            &[],
-        )
-        .await;
-        assert!(matches!(&actions[0], ScriptAction::Failed { .. }));
-    }
-
-    #[tokio::test]
     async fn run_action_uploads_and_execs() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
-        let actions = plan_scripts(
-            &[item("s", "s.sh", &[])],
-            &HashMap::new(),
-            tmp.path(),
-            "/bin/bash",
-            &[],
-        )
-        .await;
+        let actions = plan_scripts(&[item("s", "s.sh")], tmp.path(), "/bin/bash", &[]).await;
         let remote = InMemoryRemote::new();
         let reporter = CapturedReporter::new();
         let outcome = execute_script::<InMemoryRemote>(&actions[0], &remote, &reporter).await;

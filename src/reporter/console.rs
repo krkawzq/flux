@@ -54,7 +54,7 @@ impl Reporter for ConsoleReporter {
         };
         let detail = match outcome {
             ItemOutcome::Skipped(reason) => format!(" ({})", skip_reason_label(reason)),
-            ItemOutcome::Failed(error) => format!(" ({error})"),
+            ItemOutcome::Failed(error) => format!(" ({})", error),
             ItemOutcome::Applied => String::new(),
         };
         let _ = self
@@ -136,7 +136,6 @@ fn skip_reason_label(reason: &SkipReason) -> String {
         SkipReason::AlreadyExists => "already exists".into(),
         SkipReason::RemoteNewer => "remote newer".into(),
         SkipReason::ContentUnchanged => "content unchanged".into(),
-        SkipReason::DependencyFailed(dep) => format!("dep {dep} failed"),
     }
 }
 
@@ -213,7 +212,6 @@ mod tests {
             SkipReason::AlreadyExists,
             SkipReason::RemoteNewer,
             SkipReason::ContentUnchanged,
-            SkipReason::DependencyFailed("x".into()),
         ] {
             let rendered = skip_reason_label(&reason);
             assert!(!rendered.is_empty());

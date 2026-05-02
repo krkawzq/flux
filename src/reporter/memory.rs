@@ -148,9 +148,18 @@ mod tests {
 
     #[test]
     fn applied_count_tallies() {
+        use crate::sync::SyncError;
+        use std::sync::Arc;
+
         let reporter = CapturedReporter::new();
         reporter.item_finished(Stage::File, "a", &ItemOutcome::Applied);
-        reporter.item_finished(Stage::File, "b", &ItemOutcome::Failed("err".into()));
+        reporter.item_finished(
+            Stage::File,
+            "b",
+            &ItemOutcome::Failed(Arc::new(SyncError::Remote(
+                crate::remote::RemoteOpsError::Io("err".into()),
+            ))),
+        );
         reporter.item_finished(Stage::File, "c", &ItemOutcome::Applied);
         assert_eq!(reporter.applied_count(Stage::File), 2);
         assert_eq!(reporter.failed_items(Stage::File), vec!["b"]);

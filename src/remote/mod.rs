@@ -5,10 +5,12 @@
 //! use `remote::fake::InMemoryRemote`.
 
 pub mod fake;
+pub mod retry;
 pub mod ssh;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+pub use retry::{RetryPolicy, with_retry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecOutput {
@@ -31,7 +33,7 @@ impl ExecOutput {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum RemoteOpsError {
     #[error("remote command failed (status={status}): {stderr}")]
     NonZeroExit { status: i32, stderr: String },
@@ -55,7 +57,9 @@ pub trait RemoteOps: Send + Sync {
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), RemoteOpsError>;
     async fn exists(&self, path: &str) -> Result<bool, RemoteOpsError>;
     async fn mtime(&self, path: &str) -> Result<DateTime<Utc>, RemoteOpsError>;
+    async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError>;
     async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError>;
+    async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError>;
     async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError>;
 
     /// Like `exec` but streams stdin/stdout/stderr to the local terminal.

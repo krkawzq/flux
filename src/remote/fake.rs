@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Duration as StdDuration;
 
 /// Predefined response for an exec command match.
 pub struct ExecRule {
@@ -22,9 +23,10 @@ struct Inner {
     dirs: HashSet<String>,
     exec_rules: Vec<ExecRule>,
     exec_calls: Vec<String>,
-    interactive_calls: Vec<String>,
+    interactive_calls: Vec<(String, Option<StdDuration>)>,
     interactive_exit_status: i32,
     write_calls: Vec<(String, Vec<u8>)>,
+    transient_failures: HashMap<&'static str, Vec<RemoteOpsError>>,
 }
 
 #[derive(Default)]
@@ -64,6 +66,16 @@ impl InMemoryRemote {
         self.inner.lock().unwrap().interactive_exit_status = status;
     }
 
+    pub fn fail_next(&self, op: &'static str, err: RemoteOpsError) {
+        self.inner
+            .lock()
+            .unwrap()
+            .transient_failures
+            .entry(op)
+            .or_default()
+            .push(err);
+    }
+
     pub fn exec_calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().exec_calls.clone()
     }
@@ -72,7 +84,7 @@ impl InMemoryRemote {
         self.inner.lock().unwrap().write_calls.clone()
     }
 
-    pub fn interactive_calls(&self) -> Vec<String> {
+    pub fn interactive_calls(&self) -> Vec<(String, Option<StdDuration>)> {
         self.inner.lock().unwrap().interactive_calls.clone()
     }
 
@@ -83,12 +95,27 @@ impl InMemoryRemote {
     pub fn file_mode(&self, path: &str) -> Option<u32> {
         self.inner.lock().unwrap().modes.get(path).copied()
     }
+
+    fn take_failure(guard: &mut Inner, op: &'static str) -> Option<RemoteOpsError> {
+        let failures = guard.transient_failures.get_mut(op)?;
+        if failures.is_empty() {
+            return None;
+        }
+        let err = failures.remove(0);
+        if failures.is_empty() {
+            guard.transient_failures.remove(op);
+        }
+        Some(err)
+    }
 }
 
 #[async_trait]
 impl RemoteOps for InMemoryRemote {
     async fn exec(&self, cmd: &str) -> Result<ExecOutput, RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "exec") {
+            return Err(err);
+        }
         guard.exec_calls.push(cmd.to_string());
         for rule in &guard.exec_rules {
             if (rule.matcher)(cmd) {
@@ -107,9 +134,11 @@ impl RemoteOps for InMemoryRemote {
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, RemoteOpsError> {
-        self.inner
-            .lock()
-            .unwrap()
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "read_file") {
+            return Err(err);
+        }
+        guard
             .files
             .get(path)
             .cloned()
@@ -118,6 +147,9 @@ impl RemoteOps for InMemoryRemote {
 
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<(), RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "write_file") {
+            return Err(err);
+        }
         guard.write_calls.push((path.to_string(), data.to_vec()));
         guard.files.insert(path.to_string(), data.to_vec());
         let prev = guard.mtimes.get(path).copied();
@@ -129,14 +161,19 @@ impl RemoteOps for InMemoryRemote {
     }
 
     async fn exists(&self, path: &str) -> Result<bool, RemoteOpsError> {
-        let guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "exists") {
+            return Err(err);
+        }
         Ok(guard.files.contains_key(path) || guard.dirs.contains(path))
     }
 
     async fn mtime(&self, path: &str) -> Result<DateTime<Utc>, RemoteOpsError> {
-        self.inner
-            .lock()
-            .unwrap()
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "mtime") {
+            return Err(err);
+        }
+        guard
             .mtimes
             .get(path)
             .copied()
@@ -144,7 +181,10 @@ impl RemoteOps for InMemoryRemote {
     }
 
     async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError> {
-        let guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "stat_mode") {
+            return Err(err);
+        }
         if let Some(mode) = guard.modes.get(path).copied() {
             return Ok(mode);
         }
@@ -156,6 +196,9 @@ impl RemoteOps for InMemoryRemote {
 
     async fn chmod(&self, path: &str, mode: u32) -> Result<(), RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "chmod") {
+            return Err(err);
+        }
         if !guard.files.contains_key(path) && !guard.dirs.contains(path) {
             return Err(RemoteOpsError::NotFound(path.to_string()));
         }
@@ -165,6 +208,9 @@ impl RemoteOps for InMemoryRemote {
 
     async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "remove_file") {
+            return Err(err);
+        }
         guard.files.remove(path);
         guard.mtimes.remove(path);
         guard.modes.remove(path);
@@ -172,13 +218,24 @@ impl RemoteOps for InMemoryRemote {
     }
 
     async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError> {
-        self.inner.lock().unwrap().dirs.insert(path.to_string());
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(err) = Self::take_failure(&mut guard, "ensure_dir") {
+            return Err(err);
+        }
+        guard.dirs.insert(path.to_string());
         Ok(())
     }
 
-    async fn interactive_exec(&self, cmd: &str) -> Result<i32, RemoteOpsError> {
+    async fn interactive_exec(
+        &self,
+        cmd: &str,
+        timeout: Option<StdDuration>,
+    ) -> Result<i32, RemoteOpsError> {
         let mut guard = self.inner.lock().unwrap();
-        guard.interactive_calls.push(cmd.to_string());
+        if let Some(err) = Self::take_failure(&mut guard, "interactive_exec") {
+            return Err(err);
+        }
+        guard.interactive_calls.push((cmd.to_string(), timeout));
         Ok(guard.interactive_exit_status)
     }
 }
@@ -263,5 +320,16 @@ mod tests {
             remote.exec_calls(),
             vec!["echo hi".to_string(), "ls /".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn injected_transient_error_fires_once() {
+        let remote = InMemoryRemote::with_files([("/a", b"x".to_vec())]);
+        remote.fail_next("exists", RemoteOpsError::Transport("flake".into()));
+        assert!(matches!(
+            remote.exists("/a").await.unwrap_err(),
+            RemoteOpsError::Transport(_)
+        ));
+        assert!(remote.exists("/a").await.unwrap());
     }
 }

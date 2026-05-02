@@ -4,6 +4,7 @@ pub mod ssh_config;
 
 use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
+use crate::remote::RetryPolicy;
 use crate::reporter::console::ConsoleReporter;
 use crate::reporter::Reporter;
 use crate::sync::{Pipeline, PipelineOpts};
@@ -29,6 +30,8 @@ pub async fn run_sync(
     save: Option<String>,
     dry_run: bool,
     max_concurrency: Option<usize>,
+    retries: u8,
+    script_timeout: Option<u64>,
 ) -> Result<()> {
     let (mut config, config_path) =
         Config::find_and_load(name_or_path).context("loading config")?;
@@ -56,6 +59,11 @@ pub async fn run_sync(
         opts: PipelineOpts {
             dry_run,
             max_concurrency: max_concurrency.unwrap_or(8),
+            retry: RetryPolicy {
+                max_attempts: retries.max(1),
+                base_backoff: std::time::Duration::from_millis(200),
+            },
+            script_timeout: script_timeout.map(std::time::Duration::from_secs),
         },
     };
     let summary = pipeline.run().await;

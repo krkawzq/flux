@@ -59,8 +59,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn retries_on_transport_then_succeeds() {

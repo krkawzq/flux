@@ -4,6 +4,7 @@
 //! mutate remote state; the `execute_*` companions consume them.
 
 use crate::sync::SyncError;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
@@ -28,8 +29,9 @@ pub enum FileAction {
     },
     Apply {
         item_name: String,
+        src: PathBuf,
         dst: String,
-        bytes: Vec<u8>,
+        len: u64,
         chmod: Option<u32>,
     },
     Failed {

@@ -10,7 +10,8 @@ pub mod ssh;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-pub use retry::{RetryPolicy, with_retry};
+pub use retry::{with_retry, RetryPolicy};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecOutput {
@@ -64,5 +65,9 @@ pub trait RemoteOps: Send + Sync {
 
     /// Like `exec` but streams stdin/stdout/stderr to the local terminal.
     /// Returns the remote process exit status.
-    async fn interactive_exec(&self, cmd: &str) -> Result<i32, RemoteOpsError>;
+    async fn interactive_exec(
+        &self,
+        cmd: &str,
+        timeout: Option<Duration>,
+    ) -> Result<i32, RemoteOpsError>;
 }

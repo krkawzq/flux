@@ -11,7 +11,8 @@ pub mod script;
 
 use crate::config::Config;
 use crate::remote::ssh::{SshClient, SshConfig};
-use crate::remote::{RemoteOps, RemoteOpsError};
+use crate::remote::RetryPolicy;
+use crate::remote::{with_retry, RemoteOps, RemoteOpsError};
 use crate::reporter::{ItemOutcome, PipelineSummary, Reporter, Stage, StageSummary};
 use crate::sync::plan::{BlockAction, FileAction, Plan, RegisterPubkeyAction, ScriptAction};
 use anyhow::Result;
@@ -20,6 +21,7 @@ use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum SyncError {
@@ -37,6 +39,8 @@ pub enum SyncError {
 pub struct PipelineOpts {
     pub dry_run: bool,
     pub max_concurrency: usize,
+    pub retry: RetryPolicy,
+    pub script_timeout: Option<Duration>,
 }
 
 impl Default for PipelineOpts {
@@ -44,6 +48,8 @@ impl Default for PipelineOpts {
         Self {
             dry_run: false,
             max_concurrency: 8,
+            retry: RetryPolicy::default(),
+            script_timeout: None,
         }
     }
 }
@@ -67,9 +73,13 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 .unwrap_or_default(),
             remote_authorized_keys: "~/.ssh/authorized_keys".into(),
         });
-        let file_actions =
-            file::plan_files_with_concurrency(&self.config.file, self.remote, self.opts.max_concurrency)
-                .await;
+        let file_actions = file::plan_files_with_concurrency(
+            &self.config.file,
+            self.remote,
+            self.opts.max_concurrency,
+            self.opts.retry,
+        )
+        .await;
         let script_actions = script::plan_scripts(
             &self.config.script,
             self.asset_root,
@@ -83,6 +93,7 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             &self.config.comment_template,
             self.remote,
             self.opts.max_concurrency,
+            self.opts.retry,
         )
         .await;
         Plan {
@@ -103,7 +114,17 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 dry_run: true,
             };
         }
-        self.execute(&plan).await
+        tokio::select! {
+            summary = self.execute(&plan) => summary,
+            _ = tokio::signal::ctrl_c() => {
+                self.reporter.warning("interrupted by user (Ctrl-C)");
+                PipelineSummary {
+                    stages: vec![],
+                    interrupted: true,
+                    dry_run: false,
+                }
+            }
+        }
     }
 
     pub async fn execute(&self, plan: &Plan) -> PipelineSummary {
@@ -125,14 +146,13 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
 
     async fn execute_file_stage(&self, actions: &[FileAction]) -> StageSummary {
         self.reporter.stage_started(Stage::File, actions.len());
-        let outcomes: Vec<ItemOutcome> =
-            futures::stream::iter(actions.iter())
-                .map(|action| async move {
-                    file::execute_file(action, self.remote, self.reporter).await
-                })
-                .buffer_unordered(self.opts.max_concurrency)
-                .collect()
-                .await;
+        let outcomes: Vec<ItemOutcome> = futures::stream::iter(actions.iter())
+            .map(|action| async move {
+                file::execute_file(action, self.remote, self.reporter, self.opts.retry).await
+            })
+            .buffer_unordered(self.opts.max_concurrency)
+            .collect()
+            .await;
         let summary = tally(Stage::File, &outcomes);
         self.reporter.stage_finished(&summary);
         summary
@@ -142,7 +162,16 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
         self.reporter.stage_started(Stage::Script, actions.len());
         let mut outcomes = Vec::with_capacity(actions.len());
         for action in actions {
-            outcomes.push(script::execute_script(action, self.remote, self.reporter).await);
+            outcomes.push(
+                script::execute_script(
+                    action,
+                    self.remote,
+                    self.reporter,
+                    self.opts.retry,
+                    self.opts.script_timeout,
+                )
+                .await,
+            );
         }
         let summary = tally(Stage::Script, &outcomes);
         self.reporter.stage_finished(&summary);
@@ -168,7 +197,14 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 let mut outcomes = Vec::with_capacity(group.len());
                 for action in group {
                     outcomes.push(
-                        block::execute_block(action, self.remote, &template, self.reporter).await,
+                        block::execute_block(
+                            action,
+                            self.remote,
+                            &template,
+                            self.reporter,
+                            self.opts.retry,
+                        )
+                        .await,
                     );
                 }
                 outcomes
@@ -191,13 +227,23 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
                 .map_err(|err| SyncError::Remote(RemoteOpsError::Encoding(err.to_string())))?
                 .trim()
                 .to_string();
-            let target = action.remote_authorized_keys.clone();
-            let existing = match self.remote.read_file(&target).await {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(RemoteOpsError::NotFound(_)) => String::new(),
-                Err(err) => return Err(SyncError::Remote(err)),
+            let Some(new_key) = parse_pubkey_body(&pub_str) else {
+                return Err(SyncError::Remote(RemoteOpsError::Encoding(
+                    "invalid public key format".into(),
+                )));
             };
-            if existing.lines().any(|line| line.trim() == pub_str) {
+            let target = action.remote_authorized_keys.clone();
+            let existing =
+                match with_retry(self.opts.retry, || self.remote.read_file(&target)).await {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(RemoteOpsError::NotFound(_)) => String::new(),
+                    Err(err) => return Err(SyncError::Remote(err)),
+                };
+            if existing
+                .lines()
+                .filter_map(parse_pubkey_body)
+                .any(|existing_key| existing_key == new_key)
+            {
                 return Ok::<_, SyncError>(ItemOutcome::Skipped(
                     crate::sync::plan::SkipReason::AlreadyExists,
                 ));
@@ -208,10 +254,11 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
             }
             new_content.push_str(&pub_str);
             new_content.push('\n');
-            self.remote
-                .write_file(&target, new_content.as_bytes())
-                .await?;
-            self.remote.chmod(&target, 0o600).await?;
+            with_retry(self.opts.retry, || {
+                self.remote.write_file(&target, new_content.as_bytes())
+            })
+            .await?;
+            with_retry(self.opts.retry, || self.remote.chmod(&target, 0o600)).await?;
             Ok(ItemOutcome::Applied)
         }
         .await;
@@ -226,6 +273,19 @@ impl<'a, R: RemoteOps + ?Sized> Pipeline<'a, R> {
         self.reporter.stage_finished(&summary);
         summary
     }
+}
+
+fn parse_pubkey_body(line: &str) -> Option<(String, String)> {
+    let mut parts = line.split_whitespace();
+    let key_type = parts.next()?;
+    if !(key_type.starts_with("ssh-")
+        || key_type.starts_with("ecdsa-")
+        || key_type.starts_with("sk-"))
+    {
+        return None;
+    }
+    let key_body = parts.next()?;
+    Some((key_type.to_string(), key_body.to_string()))
 }
 
 fn tally(stage: Stage, outcomes: &[ItemOutcome]) -> StageSummary {
@@ -446,6 +506,8 @@ mod tests {
             opts: PipelineOpts {
                 dry_run: true,
                 max_concurrency: 4,
+                retry: RetryPolicy::default(),
+                script_timeout: None,
             },
         };
         let _ = pipe.run().await;
@@ -485,5 +547,47 @@ mod tests {
         let summary = pipe.run().await;
         assert_eq!(summary.stages[0].failed, 1);
         assert_eq!(summary.stages[0].applied, 1);
+    }
+
+    #[test]
+    fn parse_pubkey_body_accepts_comment() {
+        let parsed = parse_pubkey_body("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI comment").unwrap();
+        assert_eq!(
+            parsed,
+            (
+                "ssh-ed25519".to_string(),
+                "AAAAC3NzaC1lZDI1NTE5AAAAI".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_pubkey_body_accepts_no_comment() {
+        let parsed = parse_pubkey_body("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTI=").unwrap();
+        assert_eq!(
+            parsed,
+            (
+                "ecdsa-sha2-nistp256".to_string(),
+                "AAAAE2VjZHNhLXNoYTI=".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_pubkey_body_rejects_option_prefixed_line() {
+        assert!(parse_pubkey_body(
+            "command=\"echo hi\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI comment"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn interrupted_summary_uses_sigint_exit_code() {
+        let summary = PipelineSummary {
+            stages: vec![],
+            interrupted: true,
+            dry_run: false,
+        };
+        assert_eq!(summary.exit_code(), 130);
     }
 }

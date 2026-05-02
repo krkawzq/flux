@@ -20,6 +20,10 @@ enum Commands {
         dry_run: bool,
         #[arg(long, value_name = "N")]
         max_concurrency: Option<usize>,
+        #[arg(long, default_value = "3")]
+        retries: u8,
+        #[arg(long, value_name = "SECS")]
+        script_timeout: Option<u64>,
     },
     Proxy {
         host: String,
@@ -44,7 +48,19 @@ async fn main() -> anyhow::Result<()> {
             save,
             dry_run,
             max_concurrency,
-        } => flux::cli::run_sync(&config, save, dry_run, max_concurrency).await,
+            retries,
+            script_timeout,
+        } => {
+            flux::cli::run_sync(
+                &config,
+                save,
+                dry_run,
+                max_concurrency,
+                retries,
+                script_timeout,
+            )
+            .await
+        }
         Commands::Proxy {
             host,
             local,

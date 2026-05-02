@@ -1,11 +1,12 @@
 //! Script execution stage.
 
 use crate::config::ScriptItem;
-use crate::remote::RemoteOps;
+use crate::remote::{with_retry, RemoteOps, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::ScriptAction;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ScriptError {
@@ -103,6 +104,8 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
     action: &ScriptAction,
     remote: &R,
     reporter: &dyn Reporter,
+    policy: RetryPolicy,
+    script_timeout: Option<Duration>,
 ) -> ItemOutcome {
     let name = action_name(action);
     reporter.item_started(Stage::Script, &name);
@@ -115,30 +118,30 @@ pub async fn execute_script<R: RemoteOps + ?Sized>(
             command_argv,
             ..
         } => {
-            if let Err(err) = remote.write_file(upload_to, local_script_bytes).await {
-                return finish_script(
-                    reporter,
-                    &name,
-                    ItemOutcome::Failed(Arc::new(err.into())),
-                );
+            if let Err(err) =
+                with_retry(policy, || remote.write_file(upload_to, local_script_bytes)).await
+            {
+                return finish_script(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
             }
-            if let Err(err) = remote.chmod(upload_to, 0o755).await {
-                return finish_script(
-                    reporter,
-                    &name,
-                    ItemOutcome::Failed(Arc::new(err.into())),
-                );
+            if let Err(err) = with_retry(policy, || remote.chmod(upload_to, 0o755)).await {
+                return finish_script(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
             }
             let command = command_argv
                 .iter()
                 .map(|arg| shell_quote(arg))
                 .collect::<Vec<_>>()
                 .join(" ");
-            match remote.interactive_exec(&command).await {
+            let outcome = match remote.interactive_exec(&command, script_timeout).await {
                 Ok(0) => ItemOutcome::Applied,
                 Ok(code) => ItemOutcome::Failed(Arc::new(ScriptError::ExitCode(code).into())),
                 Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
+            };
+            if let Err(err) = with_retry(policy, || remote.remove_file(upload_to)).await {
+                reporter.warning(&format!(
+                    "failed to remove remote temp script {upload_to}: {err}"
+                ));
             }
+            outcome
         }
     };
     reporter.item_finished(Stage::Script, &name, &outcome);
@@ -196,14 +199,42 @@ mod tests {
         let actions = plan_scripts(&[item("s", "s.sh")], tmp.path(), "/bin/bash", &[]).await;
         let remote = InMemoryRemote::new();
         let reporter = CapturedReporter::new();
-        let outcome = execute_script::<InMemoryRemote>(&actions[0], &remote, &reporter).await;
+        let outcome = execute_script::<InMemoryRemote>(
+            &actions[0],
+            &remote,
+            &reporter,
+            RetryPolicy::no_retry(),
+            None,
+        )
+        .await;
         assert!(matches!(outcome, ItemOutcome::Applied));
         let writes = remote.write_calls();
         assert_eq!(writes.len(), 1);
         assert!(writes[0].0.starts_with("/tmp/flux_script_"));
         let interactive = remote.interactive_calls();
         assert_eq!(interactive.len(), 1);
-        assert!(interactive[0].contains("'/bin/bash'"));
+        assert!(interactive[0].0.contains("'/bin/bash'"));
+        assert_eq!(interactive[0].1, None);
+        assert_eq!(remote.file_contents(&writes[0].0), None);
+    }
+
+    #[tokio::test]
+    async fn run_action_passes_timeout_to_interactive_exec() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("s.sh"), b"#!/bin/sh\necho hi").unwrap();
+        let actions = plan_scripts(&[item("s", "s.sh")], tmp.path(), "/bin/bash", &[]).await;
+        let remote = InMemoryRemote::new();
+        let reporter = CapturedReporter::new();
+        let timeout = Duration::from_secs(3);
+        let _ = execute_script::<InMemoryRemote>(
+            &actions[0],
+            &remote,
+            &reporter,
+            RetryPolicy::no_retry(),
+            Some(timeout),
+        )
+        .await;
+        assert_eq!(remote.interactive_calls()[0].1, Some(timeout));
     }
 
     proptest::proptest! {

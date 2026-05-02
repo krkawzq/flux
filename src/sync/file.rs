@@ -2,7 +2,7 @@
 
 use crate::config::{FileItem, SyncMode};
 use crate::path::FluxPath;
-use crate::remote::{RemoteOps, RemoteOpsError};
+use crate::remote::{with_retry, RemoteOps, RemoteOpsError, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{FileAction, SkipReason};
 use sha2::{Digest, Sha256};
@@ -25,20 +25,21 @@ pub enum FileError {
 
 /// Compute file actions without touching the remote write surface.
 pub async fn plan_files<R: RemoteOps + ?Sized>(items: &[FileItem], remote: &R) -> Vec<FileAction> {
-    plan_files_with_concurrency(items, remote, 1).await
+    plan_files_with_concurrency(items, remote, 1, RetryPolicy::no_retry()).await
 }
 
 pub async fn plan_files_with_concurrency<R: RemoteOps + ?Sized>(
     items: &[FileItem],
     remote: &R,
     max_concurrency: usize,
+    policy: RetryPolicy,
 ) -> Vec<FileAction> {
     use futures::stream::{self, StreamExt};
 
     let indexed: Vec<(usize, &FileItem)> = items.iter().enumerate().collect();
     let mut results: Vec<Option<FileAction>> = (0..items.len()).map(|_| None).collect();
     let mut stream = stream::iter(indexed)
-        .map(|(idx, item)| async move { (idx, plan_one_file(item, remote).await) })
+        .map(|(idx, item)| async move { (idx, plan_one_file(item, remote, policy).await) })
         .buffer_unordered(max_concurrency.max(1));
 
     while let Some((idx, action)) = stream.next().await {
@@ -48,7 +49,11 @@ pub async fn plan_files_with_concurrency<R: RemoteOps + ?Sized>(
     results.into_iter().map(|result| result.unwrap()).collect()
 }
 
-async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> FileAction {
+async fn plan_one_file<R: RemoteOps + ?Sized>(
+    item: &FileItem,
+    remote: &R,
+    policy: RetryPolicy,
+) -> FileAction {
     let item_name = item.name.clone().unwrap_or_else(|| item.src.clone());
     let src = FluxPath::parse(&item.src);
     let dst = FluxPath::parse(&item.dst);
@@ -101,21 +106,13 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
             error: FileError::SourceIsDirectory(local_path.display().to_string()).into(),
         };
     }
-    let bytes = match std::fs::read(&local_path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return FileAction::Failed {
-                item_name,
-                error: FileError::LocalIo(err.to_string()).into(),
-            };
-        }
-    };
 
+    let len = metadata.len();
     let chmod = item
         .chmod
         .as_deref()
         .and_then(|value| u32::from_str_radix(value, 8).ok());
-    let exists_remote = match remote.exists(&remote_path).await {
+    let exists_remote = match with_retry(policy, || remote.exists(&remote_path)).await {
         Ok(exists) => exists,
         Err(err) => {
             return FileAction::Failed {
@@ -140,14 +137,23 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
                     };
                 }
             };
-            match remote.mtime(&remote_path).await {
+            match with_retry(policy, || remote.mtime(&remote_path)).await {
                 Ok(remote_mtime) if remote_mtime > local_mtime => FileAction::Skip {
                     item_name,
                     reason: SkipReason::RemoteNewer,
                 },
                 Ok(remote_mtime) if remote_mtime == local_mtime => {
-                    match remote.read_file(&remote_path).await {
-                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&bytes) => {
+                    let local_bytes = match read_local_bytes(&local_path) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            return FileAction::Failed {
+                                item_name,
+                                error: err.into(),
+                            };
+                        }
+                    };
+                    match with_retry(policy, || remote.read_file(&remote_path)).await {
+                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&local_bytes) => {
                             FileAction::Skip {
                                 item_name,
                                 reason: SkipReason::ContentUnchanged,
@@ -155,8 +161,9 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
                         }
                         Ok(_) => FileAction::Apply {
                             item_name,
+                            src: local_path,
                             dst: remote_path,
-                            bytes,
+                            len,
                             chmod,
                         },
                         Err(err) => FileAction::Failed {
@@ -167,8 +174,9 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
                 }
                 Ok(_) => FileAction::Apply {
                     item_name,
+                    src: local_path,
                     dst: remote_path,
-                    bytes,
+                    len,
                     chmod,
                 },
                 Err(err) => FileAction::Failed {
@@ -179,11 +187,16 @@ async fn plan_one_file<R: RemoteOps + ?Sized>(item: &FileItem, remote: &R) -> Fi
         }
         _ => FileAction::Apply {
             item_name,
+            src: local_path,
             dst: remote_path,
-            bytes,
+            len,
             chmod,
         },
     }
+}
+
+fn read_local_bytes(path: &Path) -> Result<Vec<u8>, FileError> {
+    std::fs::read(path).map_err(|err| FileError::LocalIo(err.to_string()))
 }
 
 fn local_mtime(path: &Path) -> Result<chrono::DateTime<chrono::Utc>, RemoteOpsError> {
@@ -204,6 +217,7 @@ pub async fn execute_file<R: RemoteOps + ?Sized>(
     action: &FileAction,
     remote: &R,
     reporter: &dyn Reporter,
+    policy: RetryPolicy,
 ) -> ItemOutcome {
     let name = action_name(action);
     reporter.item_started(Stage::File, &name);
@@ -211,31 +225,28 @@ pub async fn execute_file<R: RemoteOps + ?Sized>(
         FileAction::Skip { reason, .. } => ItemOutcome::Skipped(reason.clone()),
         FileAction::Failed { error, .. } => ItemOutcome::Failed(Arc::new(error.clone())),
         FileAction::Apply {
-            dst, bytes, chmod, ..
+            src, dst, chmod, ..
         } => {
             if let Some(parent) = parent_dir(dst) {
-                if let Err(err) = remote.ensure_dir(parent).await {
-                    return finish(
-                        reporter,
-                        &name,
-                        ItemOutcome::Failed(Arc::new(err.into())),
-                    );
+                if let Err(err) = with_retry(policy, || remote.ensure_dir(parent)).await {
+                    return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
                 }
             }
-            if let Err(err) = remote.write_file(dst, bytes).await {
-                return finish(
-                    reporter,
-                    &name,
-                    ItemOutcome::Failed(Arc::new(err.into())),
-                );
+            let bytes = match read_local_bytes(src) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
+                }
+            };
+            if let Err(err) = with_retry(policy, || remote.write_file(dst, &bytes)).await {
+                return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
             }
             if let Some(mode) = chmod {
-                if let Err(err) = remote.chmod(dst, *mode).await {
-                    return finish(
-                        reporter,
-                        &name,
-                        ItemOutcome::Failed(Arc::new(err.into())),
-                    );
+                let current_mode = with_retry(policy, || remote.stat_mode(dst)).await.ok();
+                if current_mode != Some(*mode) {
+                    if let Err(err) = with_retry(policy, || remote.chmod(dst, *mode)).await {
+                        return finish(reporter, &name, ItemOutcome::Failed(Arc::new(err.into())));
+                    }
                 }
             }
             ItemOutcome::Applied
@@ -314,7 +325,17 @@ mod tests {
         let src = local_file(&tmp, "a.txt", b"new");
         let remote = InMemoryRemote::with_files([("/r/a.txt", b"old".to_vec())]);
         let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Cover)], &remote).await;
-        assert!(matches!(&actions[0], FileAction::Apply { .. }));
+        match &actions[0] {
+            FileAction::Apply {
+                src: planned_src,
+                len,
+                ..
+            } => {
+                assert_eq!(planned_src, &std::path::PathBuf::from(&src));
+                assert_eq!(*len, 3);
+            }
+            other => panic!("expected apply action, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -374,9 +395,41 @@ mod tests {
         file.chmod = Some("600".into());
         let actions = plan_files(&[file], &remote).await;
         let reporter = CapturedReporter::new();
-        let outcome = execute_file(&actions[0], &remote, &reporter).await;
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
         assert!(matches!(outcome, ItemOutcome::Applied));
         assert_eq!(remote.file_contents("/r/a.txt"), Some(b"hello".to_vec()));
         assert_eq!(remote.file_mode("/r/a.txt"), Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn execute_apply_skips_redundant_chmod() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let remote = InMemoryRemote::new();
+        remote.write_file("/r/a.txt", b"old").await.unwrap();
+        remote.chmod("/r/a.txt", 0o600).await.unwrap();
+        let mut file = item("a", &src, ":/r/a.txt", SyncMode::Cover);
+        file.chmod = Some("600".into());
+        let actions = plan_files(&[file], &remote).await;
+        let reporter = CapturedReporter::new();
+        let outcome = execute_file(&actions[0], &remote, &reporter, RetryPolicy::no_retry()).await;
+        assert!(matches!(outcome, ItemOutcome::Applied));
+        assert_eq!(remote.file_mode("/r/a.txt"), Some(0o600));
+    }
+
+    #[tokio::test]
+    async fn plan_retries_transient_exists_error() {
+        let tmp = TempDir::new().unwrap();
+        let src = local_file(&tmp, "a.txt", b"hello");
+        let remote = InMemoryRemote::new();
+        remote.fail_next("exists", RemoteOpsError::Transport("flake".into()));
+        let actions = plan_files_with_concurrency(
+            &[item("a", &src, ":/r/a.txt", SyncMode::Cover)],
+            &remote,
+            1,
+            RetryPolicy::default(),
+        )
+        .await;
+        assert!(matches!(&actions[0], FileAction::Apply { .. }));
     }
 }

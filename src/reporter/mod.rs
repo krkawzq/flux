@@ -4,8 +4,8 @@
 pub mod console;
 pub mod memory;
 
-use crate::sync::SyncError;
 use crate::sync::plan::{Plan, SkipReason};
+use crate::sync::SyncError;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

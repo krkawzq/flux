@@ -7,11 +7,13 @@ use crate::remote::{ExecOutput, RemoteOps, RemoteOpsError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use futures::future::pending;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKey};
-use russh::{client, Channel, ChannelMsg, Disconnect};
+use russh::{client, Channel, ChannelMsg, Disconnect, Sig};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -310,16 +312,15 @@ impl SshClient {
     }
 
     /// Execute command with stdin/stdout streaming (with PTY)
-    pub async fn exec_interactive(&self, command: &str) -> Result<i32> {
+    pub async fn exec_interactive(&self, command: &str, timeout: Option<Duration>) -> Result<i32> {
         let mut channel = self
             .session
             .channel_open_session()
             .await
             .context("Failed to open SSH channel")?;
 
-        // Request PTY for interactive commands
         channel
-            .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+            .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
             .await
             .context("Failed to request PTY")?;
 
@@ -328,50 +329,80 @@ impl SshClient {
             .await
             .context("Failed to execute command")?;
 
-        let mut stdin_writer = channel.make_writer();
-        let stdin_task = tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            tokio::io::copy(&mut stdin, &mut stdin_writer).await?;
-            stdin_writer.shutdown().await
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
+        let mut stdin_buf = [0u8; 8192];
+        let mut stdin_closed = false;
+        let mut exit_code = None;
+        let mut first_ctrl_c = None::<Instant>;
+        let timeout_label = timeout;
+        let mut timeout_fut = Box::pin(async move {
+            if let Some(duration) = timeout {
+                tokio::time::sleep(duration).await;
+            } else {
+                pending::<()>().await;
+            }
         });
 
-        let mut exit_code = 0;
-
         loop {
-            let msg = channel.wait().await;
-            match msg {
-                Some(ChannelMsg::Data { data }) => {
-                    tokio::io::stdout().write_all(&data).await?;
-                    tokio::io::stdout().flush().await?;
-                }
-                Some(ChannelMsg::ExtendedData { data, ext }) => {
-                    if ext == 1 {
-                        tokio::io::stderr().write_all(&data).await?;
-                        tokio::io::stderr().flush().await?;
+            tokio::select! {
+                read = stdin.read(&mut stdin_buf), if !stdin_closed => {
+                    match read {
+                        Ok(0) => {
+                            stdin_closed = true;
+                            channel.eof().await.ok();
+                        }
+                        Ok(n) => {
+                            channel
+                                .data(&stdin_buf[..n])
+                                .await
+                                .context("Failed to forward stdin to remote PTY")?;
+                        }
+                        Err(err) => return Err(err).context("Failed to read local stdin"),
                     }
                 }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = exit_status as i32;
+                msg = channel.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Data { data }) => {
+                            stdout.write_all(&data).await?;
+                            stdout.flush().await?;
+                        }
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            stderr.write_all(&data).await?;
+                            stderr.flush().await?;
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            exit_code = Some(exit_status as i32);
+                            break;
+                        }
+                        Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => break,
+                        _ => {}
+                    }
                 }
-                Some(ChannelMsg::Eof) | None => break,
-                _ => {}
+                _ = tokio::signal::ctrl_c() => {
+                    let now = Instant::now();
+                    let second_press = first_ctrl_c
+                        .map(|first| now.duration_since(first) <= Duration::from_secs(5))
+                        .unwrap_or(false);
+                    if second_press {
+                        channel.close().await.ok();
+                    } else {
+                        channel.signal(Sig::INT).await.ok();
+                        first_ctrl_c = Some(now);
+                    }
+                }
+                _ = &mut timeout_fut => {
+                    channel.close().await.ok();
+                    let duration = timeout_label.expect("timeout future only resolves when timeout is set");
+                    return Err(anyhow::anyhow!("interactive_exec timed out after {duration:?}"));
+                }
             }
-        }
-
-        if !stdin_task.is_finished() {
-            stdin_task.abort();
-        }
-
-        match stdin_task.await {
-            Ok(Ok(())) => {}
-            Err(e) if e.is_cancelled() => {}
-            Ok(Err(e)) => return Err(e.into()),
-            Err(e) => return Err(anyhow::Error::new(e).context("stdin forwarding task failed")),
         }
 
         channel.close().await.ok();
 
-        Ok(exit_code)
+        Ok(exit_code.unwrap_or(0))
     }
 
     /// Upload a file to the remote server
@@ -645,8 +676,14 @@ impl RemoteOps for SshClient {
         }
     }
 
-    async fn interactive_exec(&self, cmd: &str) -> Result<i32, RemoteOpsError> {
-        self.exec_interactive(cmd).await.map_err(map_anyhow)
+    async fn interactive_exec(
+        &self,
+        cmd: &str,
+        timeout: Option<Duration>,
+    ) -> Result<i32, RemoteOpsError> {
+        self.exec_interactive(cmd, timeout)
+            .await
+            .map_err(map_anyhow)
     }
 }
 

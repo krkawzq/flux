@@ -148,11 +148,12 @@ fn print_file_action(reporter: &ConsoleReporter, action: &FileAction) {
         )),
         FileAction::Apply {
             item_name,
+            len,
             dst,
             chmod,
             ..
         } => out.write_line(&format!(
-            "  [file] ✓ apply  {item_name} -> {dst}{}",
+            "  [file] ✓ apply  {item_name} -> {dst} ({len} bytes){}",
             chmod
                 .map(|mode| format!(" chmod={mode:o}"))
                 .unwrap_or_default()

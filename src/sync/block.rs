@@ -2,7 +2,7 @@
 
 use crate::config::{BlockItem, SyncMode};
 use crate::path::FluxPath;
-use crate::remote::RemoteOps;
+use crate::remote::{with_retry, RemoteOps, RetryPolicy};
 use crate::reporter::{ItemOutcome, Reporter, Stage};
 use crate::sync::plan::{BlockAction, Sentinel, SkipReason};
 use chrono::{DateTime, Utc};
@@ -103,7 +103,15 @@ pub async fn plan_blocks<R: RemoteOps + ?Sized>(
     template: &str,
     remote: &R,
 ) -> Vec<BlockAction> {
-    plan_blocks_with_concurrency(items, asset_root, template, remote, 1).await
+    plan_blocks_with_concurrency(
+        items,
+        asset_root,
+        template,
+        remote,
+        1,
+        RetryPolicy::no_retry(),
+    )
+    .await
 }
 
 pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
@@ -112,13 +120,19 @@ pub async fn plan_blocks_with_concurrency<R: RemoteOps + ?Sized>(
     template: &str,
     remote: &R,
     max_concurrency: usize,
+    policy: RetryPolicy,
 ) -> Vec<BlockAction> {
     use futures::stream::{self, StreamExt};
 
     let indexed: Vec<(usize, &BlockItem)> = items.iter().enumerate().collect();
     let mut results: Vec<Option<BlockAction>> = (0..items.len()).map(|_| None).collect();
     let mut stream = stream::iter(indexed)
-        .map(|(idx, item)| async move { (idx, plan_one_block(item, asset_root, template, remote).await) })
+        .map(|(idx, item)| async move {
+            (
+                idx,
+                plan_one_block(item, asset_root, template, remote, policy).await,
+            )
+        })
         .buffer_unordered(max_concurrency.max(1));
 
     while let Some((idx, action)) = stream.next().await {
@@ -133,6 +147,7 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
     asset_root: &Path,
     template: &str,
     remote: &R,
+    policy: RetryPolicy,
 ) -> BlockAction {
     let item_name = item.name.clone();
     let local_path = resolve_block_path(asset_root, &item.path);
@@ -163,7 +178,7 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
         }
     };
 
-    let exists_remote = match remote.exists(&target).await {
+    let exists_remote = match with_retry(policy, || remote.exists(&target)).await {
         Ok(exists) => exists,
         Err(err) => {
             return BlockAction::Failed {
@@ -202,7 +217,7 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
         };
     }
 
-    let remote_content = match remote.read_file(&target).await {
+    let remote_content = match with_retry(policy, || remote.read_file(&target)).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(err) => {
             return BlockAction::Failed {
@@ -237,7 +252,7 @@ async fn plan_one_block<R: RemoteOps + ?Sized>(
                 let local_mtime = std::fs::metadata(&local_path)
                     .and_then(|m| m.modified())
                     .ok();
-                let remote_mtime = remote.mtime(&target).await.ok();
+                let remote_mtime = with_retry(policy, || remote.mtime(&target)).await.ok();
                 if let (Some(remote_time), Some(local_time)) = (remote_mtime, local_mtime) {
                     let local_time: DateTime<Utc> = local_time.into();
                     if remote_time > local_time {
@@ -287,6 +302,7 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
     remote: &R,
     template: &str,
     reporter: &dyn Reporter,
+    policy: RetryPolicy,
 ) -> ItemOutcome {
     let name = action_name(action);
     reporter.item_started(Stage::Block, &name);
@@ -299,8 +315,8 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
             sentinel,
             ..
         } => {
-            let current = match remote.exists(target).await {
-                Ok(true) => match remote.read_file(target).await {
+            let current = match with_retry(policy, || remote.exists(target)).await {
+                Ok(true) => match with_retry(policy, || remote.read_file(target)).await {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                     Err(err) => {
                         return finish_block(
@@ -320,10 +336,13 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
                 }
             };
             match compose(&current, body, sentinel, template, &name) {
-                Ok(content) => match remote.write_file(target, content.as_bytes()).await {
-                    Ok(()) => ItemOutcome::Applied,
-                    Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
-                },
+                Ok(content) => {
+                    match with_retry(policy, || remote.write_file(target, content.as_bytes())).await
+                    {
+                        Ok(()) => ItemOutcome::Applied,
+                        Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
+                    }
+                }
                 Err(err) => ItemOutcome::Failed(Arc::new(err.into())),
             }
         }
@@ -497,15 +516,24 @@ mod tests {
         };
 
         let actions1 = plan_blocks_with_concurrency(
-            &[item.clone()],
+            std::slice::from_ref(&item),
             tmp.path(),
             "# {}",
             &remote,
             1,
+            RetryPolicy::no_retry(),
         )
         .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let actions2 = plan_blocks_with_concurrency(&[item], tmp.path(), "# {}", &remote, 1).await;
+        let actions2 = plan_blocks_with_concurrency(
+            &[item],
+            tmp.path(),
+            "# {}",
+            &remote,
+            1,
+            RetryPolicy::no_retry(),
+        )
+        .await;
 
         let ts1 = match &actions1[0] {
             BlockAction::Apply { sentinel, .. } => sentinel.timestamp,

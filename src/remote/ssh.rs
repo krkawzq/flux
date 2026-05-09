@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use console::Term;
+use crossterm::terminal;
 use futures::future::pending;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKey};
 use russh::{client, Channel, ChannelMsg, Disconnect, Sig};
@@ -340,6 +341,7 @@ impl SshClient {
         timeout: Option<Duration>,
         cancellation: Option<&SharedCancellation>,
     ) -> Result<i32> {
+        let is_tty = Term::stdout().is_term();
         let (rows, cols) = Term::stdout().size_checked().unwrap_or((24, 80));
         let mut channel = self
             .session
@@ -347,15 +349,21 @@ impl SshClient {
             .await
             .context("Failed to open SSH channel")?;
 
-        channel
-            .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-            .await
-            .context("Failed to request PTY")?;
+        if is_tty {
+            channel
+                .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
+                .await
+                .context("Failed to request PTY")?;
+        }
 
         channel
             .exec(true, command)
             .await
             .context("Failed to execute command")?;
+
+        if is_tty {
+            terminal::enable_raw_mode().ok();
+        }
 
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -509,6 +517,7 @@ impl SshClient {
                 }
                 _ = &mut timeout_fut => {
                     channel.close().await.ok();
+                    if is_tty { terminal::disable_raw_mode().ok(); }
                     let duration = timeout_label.expect("timeout future only resolves when timeout is set");
                     return Err(anyhow::anyhow!("interactive_exec timed out after {duration:?}"));
                 }
@@ -516,6 +525,7 @@ impl SshClient {
         }
 
         channel.close().await.ok();
+        if is_tty { terminal::disable_raw_mode().ok(); }
 
         Ok(exit_code.unwrap_or(0))
     }
@@ -533,7 +543,7 @@ impl SshClient {
     /// Write content to a remote file
     pub async fn write_remote_file(&self, remote_path: &str, content: &[u8]) -> Result<()> {
         // Use cat to write file content
-        let escaped_path = shell_escape(remote_path);
+        let escaped_path = shell_escape_path(remote_path);
         let command = format!(
             "mkdir -p \"$(dirname {})\" && cat > {}",
             escaped_path, escaped_path
@@ -580,7 +590,7 @@ impl SshClient {
 
     /// Read a remote file
     pub async fn read_remote_file(&self, remote_path: &str) -> Result<Vec<u8>> {
-        let escaped_path = shell_escape(remote_path);
+        let escaped_path = shell_escape_path(remote_path);
         let result = self.exec_command(&format!("cat {}", escaped_path)).await?;
 
         if result.exit_code != 0 {
@@ -592,7 +602,7 @@ impl SshClient {
 
     /// Check if a remote file exists
     pub async fn file_exists(&self, remote_path: &str) -> Result<bool> {
-        let escaped_path = shell_escape(remote_path);
+        let escaped_path = shell_escape_path(remote_path);
         let result = self
             .exec_command(&format!("test -f {}", escaped_path))
             .await?;
@@ -601,7 +611,7 @@ impl SshClient {
 
     /// Get remote file modification time (unix timestamp)
     pub async fn get_mtime(&self, remote_path: &str) -> Result<Option<i64>> {
-        let escaped_path = shell_escape(remote_path);
+        let escaped_path = shell_escape_path(remote_path);
         let result = self
             .exec_command(&format!(
                 "stat -c %Y {} 2>/dev/null || stat -f %m {} 2>/dev/null",
@@ -619,7 +629,7 @@ impl SshClient {
 
     /// Set file permissions on remote
     pub async fn chmod_remote(&self, remote_path: &str, mode: &str) -> Result<()> {
-        let escaped_path = shell_escape(remote_path);
+        let escaped_path = shell_escape_path(remote_path);
         let result = self
             .exec_command(&format!("chmod {} {}", mode, escaped_path))
             .await?;
@@ -712,6 +722,21 @@ pub fn shell_escape(s: &str) -> String {
     out
 }
 
+/// Escape a remote file path for shell usage, expanding `~` via `$HOME`.
+///
+/// Unlike `shell_escape`, this correctly handles `~/...` paths so that
+/// the remote shell resolves them to the user's home directory.
+pub fn shell_escape_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        // $HOME is unquoted so it expands; the rest is single-quoted for safety
+        format!("$HOME/{}", shell_escape(rest))
+    } else if path == "~" {
+        "$HOME".to_string()
+    } else {
+        shell_escape(path)
+    }
+}
+
 #[async_trait]
 impl RemoteOps for SshClient {
     async fn exec(&self, cmd: &str) -> Result<ExecOutput, RemoteOpsError> {
@@ -752,7 +777,7 @@ impl RemoteOps for SshClient {
     async fn stat_mode(&self, path: &str) -> Result<u32, RemoteOpsError> {
         let cmd = format!(
             "stat -c %a {0} 2>/dev/null || stat -f %Lp {0}",
-            shell_escape(path)
+            shell_escape_path(path)
         );
         let out = self.exec_command(&cmd).await.map_err(map_anyhow)?;
         if out.exit_code != 0 {
@@ -776,8 +801,8 @@ impl RemoteOps for SshClient {
         let out = self
             .exec_command(&format!(
                 "mv -f {} {}",
-                shell_escape(from),
-                shell_escape(to)
+                shell_escape_path(from),
+                shell_escape_path(to)
             ))
             .await
             .map_err(map_anyhow)?;
@@ -792,7 +817,7 @@ impl RemoteOps for SshClient {
 
     async fn remove_file(&self, path: &str) -> Result<(), RemoteOpsError> {
         let out = self
-            .exec_command(&format!("rm -f {}", shell_escape(path)))
+            .exec_command(&format!("rm -f {}", shell_escape_path(path)))
             .await
             .map_err(map_anyhow)?;
         if out.exit_code != 0 {
@@ -806,7 +831,7 @@ impl RemoteOps for SshClient {
 
     async fn ensure_dir(&self, path: &str) -> Result<(), RemoteOpsError> {
         let out = self
-            .exec_command(&format!("mkdir -p {}", shell_escape(path)))
+            .exec_command(&format!("mkdir -p {}", shell_escape_path(path)))
             .await
             .map_err(map_anyhow)?;
         if out.exit_code == 0 {

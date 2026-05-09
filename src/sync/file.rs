@@ -579,63 +579,24 @@ async fn plan_regular_file<R: RemoteOps + ?Sized>(
             reason: SkipReason::AlreadyExists,
         },
         SyncMode::Sync if exists_remote => {
-            let local_mtime = match local_mtime(&local_path) {
-                Ok(mtime) => mtime,
-                Err(err) => {
-                    return FileAction::Failed {
-                        item_name,
-                        error: err.into(),
-                    };
-                }
+            let dominated = match (local_mtime(&local_path).ok(), with_retry(policy, || remote.mtime(&remote_path)).await.ok()) {
+                (Some(local_mt), Some(remote_mt)) if remote_mt > local_mt => true,
+                _ => false,
             };
-            match with_retry(policy, || remote.mtime(&remote_path)).await {
-                Ok(remote_mtime) if remote_mtime > local_mtime => FileAction::Skip {
+            if dominated {
+                FileAction::Skip {
                     item_name,
                     reason: SkipReason::RemoteNewer,
-                },
-                Ok(remote_mtime) if remote_mtime == local_mtime => {
-                    let local_bytes = match read_local_bytes(&local_path) {
-                        Ok(bytes) => bytes,
-                        Err(err) => {
-                            return FileAction::Failed {
-                                item_name,
-                                error: err.into(),
-                            };
-                        }
-                    };
-                    match with_retry(policy, || remote.read_file(&remote_path)).await {
-                        Ok(remote_bytes) if hash(&remote_bytes) == hash(&local_bytes) => {
-                            FileAction::Skip {
-                                item_name,
-                                reason: SkipReason::ContentUnchanged,
-                            }
-                        }
-                        Ok(_) => FileAction::Apply {
-                            item_name,
-                            src: local_path,
-                            dst: remote_path,
-                            len,
-                            chmod,
-                            observed_remote_mtime,
-                        },
-                        Err(err) => FileAction::Failed {
-                            item_name,
-                            error: err.into(),
-                        },
-                    }
                 }
-                Ok(_) => FileAction::Apply {
+            } else {
+                FileAction::Apply {
                     item_name,
                     src: local_path,
                     dst: remote_path,
                     len,
                     chmod,
                     observed_remote_mtime,
-                },
-                Err(err) => FileAction::Failed {
-                    item_name,
-                    error: err.into(),
-                },
+                }
             }
         }
         _ => FileAction::Apply {
@@ -739,8 +700,11 @@ pub(crate) async fn apply_atomic_bytes<R: RemoteOps + ?Sized>(
     }
     let backup = if with_retry(policy, || remote.exists(dst)).await? {
         let backup = unique_backup_path(dst);
-        remote.rename(dst, &backup).await?;
-        Some(backup)
+        match remote.rename(dst, &backup).await {
+            Ok(()) => Some(backup),
+            Err(RemoteOpsError::NonZeroExit { .. }) => None, // file gone between check and rename
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };
@@ -965,17 +929,33 @@ fn ensure_success(out: &ExecOutput) -> Result<(), RemoteOpsError> {
 }
 
 fn shell_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('\'');
-    for ch in input.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
+    if let Some(rest) = input.strip_prefix("~/") {
+        let mut out = String::from("$HOME/");
+        out.push('\'');
+        for ch in rest.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
         }
+        out.push('\'');
+        out
+    } else if input == "~" {
+        "$HOME".to_string()
+    } else {
+        let mut out = String::with_capacity(input.len() + 2);
+        out.push('\'');
+        for ch in input.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
     }
-    out.push('\'');
-    out
 }
 
 fn backup_timestamp(path: &str) -> Option<u128> {
@@ -1277,7 +1257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_skip_when_content_identical_with_equal_mtime() {
+    async fn sync_applies_when_mtime_equal() {
         let tmp = TempDir::new().unwrap();
         let src = local_file(&tmp, "a.txt", b"same");
         let local_modified = std::fs::metadata(&src).unwrap().modified().unwrap();
@@ -1287,13 +1267,7 @@ mod tests {
             chrono::DateTime::<chrono::Utc>::from(local_modified),
         );
         let actions = plan_files(&[item("a", &src, ":/r/a.txt", SyncMode::Sync)], &remote).await;
-        assert!(matches!(
-            &actions[0],
-            FileAction::Skip {
-                reason: SkipReason::ContentUnchanged,
-                ..
-            }
-        ));
+        assert!(matches!(&actions[0], FileAction::Apply { .. }));
     }
 
     #[tokio::test]

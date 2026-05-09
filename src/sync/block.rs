@@ -391,17 +391,11 @@ pub async fn execute_block<R: RemoteOps + ?Sized>(
             target,
             body,
             sentinel,
-            observed_remote_mtime,
             ..
         } => {
-            if remote_changed_since_plan(remote, target, *observed_remote_mtime, policy).await {
-                reporter.warning(&format!("skipping {target}: remote changed after planning"));
-                return finish_block(
-                    reporter,
-                    &name,
-                    ItemOutcome::Skipped(SkipReason::RemoteNewer),
-                );
-            }
+            // No remote_changed_since_plan check: multiple blocks targeting
+            // the same file are executed sequentially, each re-reading the
+            // current content before composing — this is safe and expected.
             let current = match with_retry(policy, || remote.exists(target)).await {
                 Ok(true) => match with_retry(policy, || remote.read_file(target)).await {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -444,18 +438,6 @@ fn finish_block(reporter: &dyn Reporter, name: &str, outcome: ItemOutcome) -> It
     outcome
 }
 
-async fn remote_changed_since_plan<R: RemoteOps + ?Sized>(
-    remote: &R,
-    path: &str,
-    observed_remote_mtime: Option<DateTime<Utc>>,
-    policy: RetryPolicy,
-) -> bool {
-    match with_retry(policy, || remote.mtime(path)).await {
-        Ok(current) => observed_remote_mtime.is_none_or(|observed| current > observed),
-        Err(crate::remote::RemoteOpsError::NotFound(_)) => false,
-        Err(_) => false,
-    }
-}
 
 fn compose(
     existing: &str,
@@ -711,49 +693,6 @@ mod tests {
         assert!(
             matches!(&actions[0], BlockAction::Apply { target, .. } if target == "/remote/.zshrc")
         );
-    }
-
-    #[tokio::test]
-    async fn execute_block_skips_if_remote_changed_between_plan_and_execute() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("aliases.sh"), b"alias x='1'\n").unwrap();
-        let remote = InMemoryRemote::with_files([("/remote/.bashrc", b"old\n".to_vec())]);
-        let item = BlockItem {
-            name: "aliases".into(),
-            path: "aliases.sh".into(),
-            file: ":/remote/.bashrc".into(),
-            mode: SyncMode::Sync,
-            comment_template: None,
-            tags: vec![],
-        };
-        let actions = plan_blocks_with_concurrency(
-            &[item],
-            tmp.path(),
-            "# {}",
-            &remote,
-            1,
-            RetryPolicy::no_retry(),
-            None,
-            false,
-        )
-        .await;
-        remote
-            .write_file("/remote/.bashrc", b"external\n")
-            .await
-            .unwrap();
-        let reporter = crate::reporter::memory::CapturedReporter::new();
-        let outcome = execute_block(
-            &actions[0],
-            &remote,
-            "# {}",
-            &reporter,
-            RetryPolicy::no_retry(),
-        )
-        .await;
-        assert!(matches!(
-            outcome,
-            ItemOutcome::Skipped(SkipReason::RemoteNewer)
-        ));
     }
 
     #[tokio::test]

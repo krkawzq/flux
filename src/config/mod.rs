@@ -60,7 +60,7 @@ fn default_comment_template() -> String {
     "# {}".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     #[serde(default)]
@@ -71,6 +71,17 @@ pub struct ProxyConfig {
     pub remote_port: u16,
     #[serde(default = "default_protocol")]
     pub protocol: ProxyProtocol,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            local_port: default_local_port(),
+            remote_port: default_remote_port(),
+            protocol: ProxyProtocol::default(),
+        }
+    }
 }
 
 fn default_local_port() -> u16 {
@@ -249,9 +260,17 @@ impl Config {
     }
 
     pub fn find_config(name_or_path: &str) -> anyhow::Result<PathBuf> {
-        let path = PathBuf::from(name_or_path);
-        if path.exists() {
-            return Ok(path);
+        let expanded = if name_or_path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                PathBuf::from(name_or_path.replacen("~", &home.to_string_lossy(), 1))
+            } else {
+                PathBuf::from(name_or_path)
+            }
+        } else {
+            PathBuf::from(name_or_path)
+        };
+        if expanded.exists() {
+            return Ok(expanded);
         }
 
         let search_dirs = vec![
@@ -295,7 +314,7 @@ impl Config {
         if self.register_key && self.key.as_deref().is_none_or(str::is_empty) {
             anyhow::bail!("register_key=true requires non-empty key");
         }
-        if self.proxy.local_port == 0 {
+        if self.proxy.enabled && self.proxy.local_port == 0 {
             anyhow::bail!("proxy.local_port must be > 0");
         }
         for file in &self.file {

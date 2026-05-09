@@ -84,9 +84,7 @@ pub async fn run_sync(
     config.validate().context("validating config")?;
     let asset_root = config.resolve_root(&config_path);
     resolve_config_paths(&mut config, &asset_root);
-    if let Some(name) = save {
-        ssh_config::save_ssh_config(&name, &config).context("saving ssh config")?;
-    }
+    // --save is handled after SSH connection is established (see run_single_host)
 
     if opts.no_cache && opts.resume {
         warn!("--resume used with --no-cache; resume state may be stale");
@@ -99,13 +97,11 @@ pub async fn run_sync(
             name_or_path,
             build_pipeline_opts(&opts)?,
             opts.resume,
+            save.as_deref(),
             &reporter,
         )
         .await?;
-        if summary.exit_code() != 0 {
-            std::process::exit(summary.exit_code());
-        }
-        return Ok(());
+        std::process::exit(summary.exit_code());
     }
 
     let pipeline_opts = build_pipeline_opts(&opts)?;
@@ -127,6 +123,7 @@ pub async fn run_sync(
                     &name,
                     pipeline_opts,
                     resume,
+                    None,
                     &reporter,
                 )
                 .await;
@@ -166,7 +163,7 @@ pub async fn run_sync(
     if any_failed {
         std::process::exit(1);
     }
-    Ok(())
+    std::process::exit(0);
 }
 
 pub async fn run_undo(name_or_path: &str, yes: bool, log_format: LogFormat) -> Result<()> {
@@ -344,7 +341,7 @@ fn build_pipeline_opts(opts: &SyncRunOptions) -> Result<PipelineOpts> {
         script_timeout: opts.script_timeout.map(std::time::Duration::from_secs),
         filter: build_pipeline_filter(opts)?,
         state: None,
-        use_cache: !opts.no_cache,
+        use_cache: false,
         resume_from: None,
         cancellation: None,
     })
@@ -356,9 +353,14 @@ async fn run_single_host(
     config_name: &str,
     mut pipeline_opts: PipelineOpts,
     resume: bool,
+    save: Option<&str>,
     reporter: &dyn Reporter,
 ) -> Result<crate::reporter::PipelineSummary> {
     let ssh_config = resolve_ssh_config(config)?;
+    if let Some(name) = save {
+        save_ssh_config_from_resolved(name, &ssh_config, config)
+            .context("saving ssh config")?;
+    }
     let state = state::load(&ssh_config.host);
     if pipeline_opts.use_cache {
         pipeline_opts.state = state.clone();
@@ -396,6 +398,70 @@ async fn run_single_host(
     }
     ssh.close().await.ok();
     Ok(summary)
+}
+
+/// Save SSH config using the resolved (interactive) connection parameters.
+fn save_ssh_config_from_resolved(
+    name: &str,
+    ssh: &crate::remote::ssh::SshConfig,
+    _config: &Config,
+) -> Result<()> {
+    let home = dirs::home_dir().context("no home dir")?;
+    let config_path = home.join(".ssh").join("config");
+    std::fs::create_dir_all(home.join(".ssh")).context("ensuring ~/.ssh dir")?;
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut block = format!("# Added by flux\nHost {name}\n");
+    block.push_str(&format!("    HostName {}\n", ssh.host));
+    block.push_str(&format!("    User {}\n", ssh.user));
+    block.push_str(&format!("    Port {}\n", ssh.port));
+    if let Some(key) = &ssh.key_path {
+        block.push_str(&format!("    IdentityFile {key}\n"));
+    }
+    // Accept ssh-rsa host keys (common on older servers)
+    block.push_str("    HostKeyAlgorithms +ssh-rsa\n");
+    block.push_str("    PubkeyAcceptedAlgorithms +ssh-rsa\n");
+
+    // Replace existing block for this host or append
+    let host_line = format!("Host {name}");
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let is_host_line = trimmed.starts_with("Host ");
+        if skipping {
+            if is_host_line {
+                skipping = false;
+                out.push_str(line);
+            }
+            continue;
+        }
+        if trimmed == host_line || trimmed == format!("# Added by flux") && skipping {
+            skipping = true;
+            continue;
+        }
+        // Also skip "# Added by flux" comment preceding our block
+        if trimmed == "# Added by flux" {
+            // peek ahead — if next meaningful line is our Host block, skip this comment too
+            skipping = false; // we'll check next iteration
+        }
+        out.push_str(line);
+    }
+    // Remove trailing "# Added by flux" if it was the last line before our block
+    if out.trim_end().ends_with("# Added by flux") {
+        let idx = out.rfind("# Added by flux").unwrap();
+        out.truncate(idx);
+    }
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&block);
+
+    std::fs::write(&config_path, out).context("writing ~/.ssh/config")
 }
 
 fn save_host_state(
@@ -570,7 +636,17 @@ where
 
 fn resolve_config_paths(config: &mut Config, asset_root: &Path) {
     let resolve_local = |path: &str, subdir: &str| -> String {
-        if path.starts_with(':') || path.starts_with('/') || path.starts_with('~') {
+        if path.starts_with(':') {
+            return path.to_string();
+        }
+        if path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                let expanded = path.replacen("~", &home.to_string_lossy(), 1);
+                return expanded;
+            }
+            return path.to_string();
+        }
+        if path.starts_with('/') {
             return path.to_string();
         }
         if path.contains('/') || path.contains('\\') {
@@ -591,6 +667,9 @@ fn resolve_config_paths(config: &mut Config, asset_root: &Path) {
         path.to_string()
     };
 
+    if let Some(ref mut key) = config.key {
+        *key = resolve_local(key, "");
+    }
     for file in &mut config.file {
         file.src = resolve_local(&file.src, "files");
     }

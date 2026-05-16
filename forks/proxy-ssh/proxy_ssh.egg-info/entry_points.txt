@@ -1,3 +1,0 @@
-[console_scripts]
-proxy-ssh = proxy_ssh:main
-pss = proxy_ssh:main

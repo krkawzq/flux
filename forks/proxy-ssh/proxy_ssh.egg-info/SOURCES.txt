@@ -1,8 +1,0 @@
-proxy_ssh.py
-setup.py
-proxy_ssh.egg-info/PKG-INFO
-proxy_ssh.egg-info/SOURCES.txt
-proxy_ssh.egg-info/dependency_links.txt
-proxy_ssh.egg-info/entry_points.txt
-proxy_ssh.egg-info/requires.txt
-proxy_ssh.egg-info/top_level.txt
